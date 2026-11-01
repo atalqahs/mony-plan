@@ -204,6 +204,36 @@ for (const sel of ['[data-act="settings"]', '[data-act="add"]', '[data-act="mont
   assert.ok(over <= 0, `ورقة ${sel} أعرض من الشاشة`);
   await p.click('.sheet [data-close]');
 }
+// تعديل دفعة من الواجهة: إدخالات خاطئة متكررة لا تغيّر شيئًا، ثم تعديل صحيح يُحفظ ويبقى بعد إعادة الفتح
+await p.evaluate(() => localStorage.setItem('mfp-view-month', '2026-11')); await p.reload(); await p.waitForSelector('.grid');
+const target = await p.evaluate(() => window.__mfp.state.payments.find((x) => x.itemId === 'violations' && x.month === '2026-11' && x.kind === 'regular'));
+const openEdit = async () => {
+  await p.click('.li [data-act="cell-detail"][data-id="violations"].amt');
+  await p.click(`.sheet [data-a="edit-pay"][data-id="${target.id}"]`);
+};
+const stOf = () => p.evaluate(() => JSON.stringify({ p: window.__mfp.state.payments, l: window.__mfp.state.log.length }));
+const stBefore = await stOf();
+for (const [amt, date] of [['-5', null], ['99999', null], ['0', null], ['160', ''], ['160', '2026-12-31']]) {
+  await openEdit();
+  await p.fill('.sheet [name="amount"]', amt);
+  if (date !== null) await p.fill('.sheet [name="date"]', date);
+  await p.click('.sheet [data-a="save"]');
+  await p.waitForSelector('.toast.err');
+  assert.equal(await stOf(), stBefore, `إدخال خاطئ (${amt}/${date}) غيّر الحالة`);
+  await p.click('.sheet [data-close]');
+}
+await p.reload(); await p.waitForSelector('.grid');
+assert.equal(await stOf(), stBefore, 'بعد إعادة الفتح');
+await openEdit();
+await p.fill('.sheet [name="amount"]', '150');
+await p.click('.sheet [data-a="save"]');
+await p.reload(); await p.waitForSelector('.grid');
+const edited = await p.evaluate((id) => window.__mfp.state.payments.find((x) => x.id === id), target.id);
+assert.equal(edited.amount, 150000);
+assert.equal(edited.createdAt, target.createdAt);
+assert.equal(await p.evaluate(() => window.__mfp.state.payments.length), JSON.parse(stBefore).p.length);
+step('تعديل الدفعات: 5 إدخالات خاطئة لا تغيّر شيئًا (ولا بعد إعادة الفتح)، والتعديل الصحيح يُحفظ ويبقى');
+
 // نافذة احتياطي الجامعة (يناير): مصادر التمويل وتواريخها
 await p.evaluate(() => localStorage.setItem('mfp-view-month', '2027-01')); await p.reload(); await p.waitForSelector('.grid');
 await p.click('.li [data-act="reserve"]');

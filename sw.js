@@ -1,5 +1,5 @@
 // يعمل دون إنترنت بعد أول تحميل. البيانات في IndexedDB ولا تتأثر بتحديث هذا الملف.
-const VERSION = 'mfp-v5';
+const VERSION = 'mfp-v6';
 const ASSETS = [
   './', './index.html', './css/app.css', './manifest.webmanifest',
   './js/app.js', './js/engine.js', './js/actions.js', './js/money.js', './js/store.js',

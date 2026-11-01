@@ -52,14 +52,14 @@ function toast(msg, err = false) {
 
 /** تسجيل دفعة مع تنبيه عند وجود دفعة مطابقة تمامًا (منع التكرار غير المقصود) */
 function addPay(data, msg) {
-  return guarded(data, (d) => A.addPayment(state, d, { today }), (dup) => `توجد دفعة مطابقة تمامًا (${fmtKD(data.amount)} د.ك، ${E.dateLabel(data.date || null)}). هل هذه عملية مستقلة فعلًا؟ اختر «إلغاء» إن كانت تكرارًا.`, msg);
+  return guarded(data, (d, draft) => A.addPayment(draft, d, { today }), (dup) => `توجد دفعة مطابقة تمامًا (${fmtKD(data.amount)} د.ك، ${E.dateLabel(data.date || null)}). هل هذه عملية مستقلة فعلًا؟ اختر «إلغاء» إن كانت تكرارًا.`, msg);
 }
 /** حفظ مع منع التكرار: مطابقة تامة تُرفض ما لم يؤكد المستخدم أنها عملية مستقلة؛ نفس opId لا يُحفظ مرتين */
 function guarded(data, run, dupMsg, msg) {
-  let err = run(data);
+  let err = A.transact(state, (draft) => run(data, draft));
   if (err === A.DUPLICATE) {
     if (!confirm(dupMsg())) { toast('لم تُسجل — عملية مكررة', true); return false; }
-    err = run({ ...data, allowDuplicate: true });
+    err = A.transact(state, (draft) => run({ ...data, allowDuplicate: true }, draft));
   }
   if (err) { toast(err, true); return false; }
   saveState(state);
@@ -69,7 +69,8 @@ function guarded(data, run, dupMsg, msg) {
 }
 /** تنفيذ عملية + حفظ + إعادة رسم */
 function commit(fn, okMsg) {
-  const err = fn(state);
+  // ذرّية: تُنفذ على نسخة، ولا يتغير شيء إن فشلت العملية أو رمت خطأ
+  const err = A.transact(state, fn);
   if (err) { toast(err, true); return false; }
   saveState(state);
   render();
@@ -252,7 +253,7 @@ function obligationsCard(m) {
     const due = md.dueDates?.[l.id];
     const subs = [];
     if (l.type === 'debt' && l.mandatory > 0) subs.push(`القسط الإلزامي ${kd(l.mandatory)}`);
-    if (due) subs.push(`الاستحقاق ${E.dateLabel(due)}`);
+    if (due) { const w = A.dueDateCheck(state, view.month, due).warning; subs.push(`الاستحقاق ${E.dateLabel(due)}${w ? ' <span class="amber">(خارج نافذة الشهر)</span>' : ''}`); }
     const tag = l.engineManaged ? '<span class="tag">جدولة تلقائية</span>' : l.stored !== null && l.type === 'expense' ? '<span class="tag">معدّل</span>' : '';
     if (l.item.openingInferred) subs.push('<span class="amber">رصيد مستنتج غير مؤكد</span>');
     if (l.pendingReg > 0) subs.push(`مسجلة بانتظار التأكيد ${kd(l.pendingReg)}`);
@@ -612,7 +613,11 @@ function cellSheet(month, id, focusPay = true) {
         const curVal = cur ? (cur.stored ?? cur.planned) : 0;
         if (Number.isNaN(planned)) return 'المبلغ غير صالح';
         if (planned !== curVal) { const e1 = A.setPlan(s, month, id, planned); if (e1) return e1; }
-        if ((due || '') !== ((s.months[month]?.dueDates || {})[id] || '')) return A.setDueDate(s, month, id, due);
+        if ((due || '') !== ((s.months[month]?.dueDates || {})[id] || '')) {
+          const e2 = A.setDueDate(s, month, id, due || null);
+          if (!e2 && due) { const w = A.dueDateCheck(s, month, due).warning; if (w) setTimeout(() => toast(w), 50); }
+          return e2;
+        }
         return null;
       }, 'تم الحفظ');
       if (ok) closeSheet();
@@ -657,12 +662,16 @@ function editPaymentSheet(pid, back) {
   const it = E.itemById(state, p.itemId);
   openSheet(`${head('تعديل دفعة', `${esc(it?.name)} — ${p.kind === 'arrears' ? 'من العجز' : 'دفعة الشهر'}`)}
     <div class="row2">${field('المبلغ', moneyInput('amount', p.amount))}${field('التاريخ', dateInput('date', p.date))}</div>
+    ${p.month < sim.F || p.date === null ? `<div class="toggle"><span>تاريخ التنفيذ غير معروف (دفعة تاريخية)</span><button class="switch ${p.date === null ? 'on' : ''}" data-name="nodate" role="switch" aria-checked="${p.date === null}"></button></div>` : ''}
     ${field('منسوبة لخطة شهر', `<select class="input" name="month">${monthOptions(p.month)}</select>`)}
     ${field('ملاحظة', `<input class="input" name="note" value="${esc(p.note)}">`)}
+    <div class="note">إن فشل التعديل لأي سبب تبقى الدفعة الأصلية كما هي دون أي تغيير.</div>
     <button class="btn" data-a="save">حفظ</button>`, (sh) => {
     on(sh, '[data-a="save"]', () => {
       const amount = money(v(sh, 'amount'));
-      if (commit((s) => A.updatePayment(s, pid, { amount, date: v(sh, 'date'), month: v(sh, 'month'), note: v(sh, 'note') }, { today }), 'تم التعديل')) (back ? back() : closeSheet());
+      const unknown = !!sw(sh, 'nodate');
+      const patch = { amount, month: v(sh, 'month'), note: v(sh, 'note'), ...(unknown ? { dateUnknown: true } : { date: v(sh, 'date'), dateUnknown: false }) };
+      if (commit((s) => A.updatePayment(s, pid, patch, { today }), 'تم التعديل')) (back ? back() : closeSheet());
     });
   });
 }
@@ -1052,7 +1061,7 @@ function visaBuySheet(id) {
     on(sh, '[data-a="save"]', () => {
       const data = { amount: money(v(sh, 'amount')), date: v(sh, 'date'), note: v(sh, 'note') };
       const done = p ? commit((s) => A.updateVisaPurchase(s, p.id, data), 'تم الحفظ')
-        : guarded({ ...data, opId }, (d) => A.addVisaPurchase(state, d, today), () => `توجد عملية شراء مطابقة (${fmtKD(data.amount)} د.ك، ${E.dateLabel(data.date)}). هل هي عملية مستقلة فعلًا؟`, 'تم الحفظ');
+        : guarded({ ...data, opId }, (d, draft) => A.addVisaPurchase(draft, d, today), () => `توجد عملية شراء مطابقة (${fmtKD(data.amount)} د.ك، ${E.dateLabel(data.date)}). هل هي عملية مستقلة فعلًا؟`, 'تم الحفظ');
       if (done) closeSheet();
     });
     on(sh, '[data-a="del"]', () => { if (confirm('حذف عملية الشراء؟') && commit((s) => A.deleteVisaPurchase(s, p.id), 'تم الحذف')) closeSheet(); });
@@ -1072,7 +1081,7 @@ function visaPaySheet() {
     on(sh, '[data-a="pay"]', () => {
       const amount = money(v(sh, 'amount'));
       const data = { amount, date: v(sh, 'date'), cashMonth: v(sh, 'cm') || null, opId };
-      if (guarded(data, (d) => A.addVisaPayment(state, d, today), () => `يوجد سداد فيزا مطابق (${fmtKD(amount)} د.ك، ${E.dateLabel(data.date)}). هل هو سداد مستقل فعلًا؟`, 'تم تسجيل السداد')) closeSheet();
+      if (guarded(data, (d, draft) => A.addVisaPayment(draft, d, today), () => `يوجد سداد فيزا مطابق (${fmtKD(amount)} د.ك، ${E.dateLabel(data.date)}). هل هو سداد مستقل فعلًا؟`, 'تم تسجيل السداد')) closeSheet();
     });
   });
 }
@@ -1214,8 +1223,12 @@ async function boot() {
     s = E.createSeedState();
     await saveState(s);
   }
-  // ترحيل آمن للبيانات المحفوظة — لا يحذف شيئًا
-  const mig = E.migrate(s);
+  // ترحيل آمن للبيانات المحفوظة — على نسخة؛ إن فشل لا يُحفظ شيء ولا تُستبدل البيانات
+  let mig;
+  try { mig = E.migrate(s); } catch (e) {
+    $('#app').innerHTML = `<header class="top"><h1>خطتي المالية</h1></header><div class="alert">تعذر تحديث صيغة البيانات المحفوظة (${esc(e.message)}). لم يُغيَّر أو يُحذف شيء. أبلغ عن المشكلة قبل أي إدخال جديد.</div>`;
+    return;
+  }
   s = mig.state;
   if (mig.changed) await saveState(s);
   state = s;

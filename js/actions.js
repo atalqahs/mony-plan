@@ -1,16 +1,38 @@
 // عمليات تعديل الحالة مع التحقق. كل دالة ترجع null عند النجاح أو رسالة خطأ.
 import {
   simulate, uid, itemById, debtStatus, visaSummary, kuwaitToday, monthLabel, dateLabel,
-  visaCycleEnd, monthOfDate, DEFAULT_PRIORITY, forecastStartOf,
+  visaCycleEnd, monthOfDate, DEFAULT_PRIORITY, forecastStartOf, addMonths, addDays, dateIn, daysInMonth,
 } from './engine.js';
 import { fmtKD } from './money.js';
 
 const nowIso = () => new Date().toISOString();
 function log(state, text) { state.log.push({ ts: nowIso(), text }); }
 const okAmount = (a) => Number.isSafeInteger(a) && a > 0;
-const okDate = (d) => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d);
-const okMonth = (m) => typeof m === 'string' && /^\d{4}-\d{2}$/.test(m);
+/** تاريخ حقيقي في التقويم (يرفض 2026-02-30 و2026-13-01)، وليس شكلًا نصيًا فقط */
+export const okDate = (d) => {
+  if (typeof d !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(d)) return false;
+  const [y, m, day] = d.split('-').map(Number);
+  const t = new Date(Date.UTC(y, m - 1, day));
+  return t.getUTCFullYear() === y && t.getUTCMonth() === m - 1 && t.getUTCDate() === day;
+};
+const okMonth = (m) => typeof m === 'string' && /^\d{4}-(0[1-9]|1[0-2])$/.test(m);
 const FUTURE = 'تاريخ عملية مؤكدة لا يمكن أن يكون في المستقبل — سجّلها غير مؤكدة أو صحّح التاريخ';
+
+/* ── المعاملات الذرّية ── */
+
+/**
+ * ينفّذ fn على نسخة عميقة من الحالة. إن رجعت fn برسالة خطأ أو رمت استثناءً لا يتغير شيء في state.
+ * إن نجحت تُستبدل محتويات state بالنسخة المعدلة دفعة واحدة. يرجع null أو رسالة الخطأ.
+ */
+export function transact(state, fn) {
+  const draft = JSON.parse(JSON.stringify(state));
+  let err;
+  try { err = fn(draft); } catch (e) { err = `خطأ غير متوقع — لم يُحفظ شيء (${e && e.message ? e.message : e})`; }
+  if (err) return err;
+  for (const k of Object.keys(state)) if (!(k in draft)) delete state[k];
+  Object.assign(state, draft);
+  return null;
+}
 
 /* ── الدفعات ── */
 
@@ -77,23 +99,24 @@ export function addPayment(state, { itemId, month, kind = 'regular', amount, dat
 }
 
 export function updatePayment(state, id, patch, opts = {}) {
-  const p = state.payments.find((x) => x.id === id);
-  if (!p) return 'الدفعة غير موجودة';
-  const before = { ...p };
-  const idx = state.payments.indexOf(p);
-  state.payments.splice(idx, 1);
-  const next = { ...before, ...patch, opId: null, allowDuplicate: true, dateUnknown: (patch.date === undefined ? before.date === null : !patch.date) };
-  if (!next.dateUnknown && !next.date) return 'التاريخ غير صالح';
-  const err = addPayment(state, next, opts);
-  if (err) { state.payments.splice(idx, 0, before); return err; }
-  // أعِد المعرّف الأصلي ووقت الإنشاء للحفاظ على التاريخ
-  const added = state.payments[state.payments.length - 1];
-  added.id = before.id; added.createdAt = before.createdAt; added.editedAt = nowIso();
-  if (before.opId) added.opId = before.opId;
-  if (!before.duplicateConfirmed) delete added.duplicateConfirmed;
-  state.log.pop();
-  const item = itemById(state, p.itemId);
-  log(state, `تعديل دفعة — ${item?.name}: ${fmtKD(before.amount)} ← ${fmtKD(added.amount)} د.ك (${monthLabel(added.month)})`);
+  const idx = state.payments.findIndex((x) => x.id === id);
+  if (idx < 0) return 'الدفعة غير موجودة';
+  const before = state.payments[idx];
+  // «تاريخ غير معروف» لا يُفترض من حقل فارغ: يجب طلبه صراحة (patch.dateUnknown === true)
+  const wantsUnknown = patch.dateUnknown === true || (patch.date === undefined && patch.dateUnknown === undefined && before.date === null);
+  if (!wantsUnknown && patch.date !== undefined && !okDate(patch.date)) return 'التاريخ غير صالح';
+  const next = { ...before, ...patch, opId: null, allowDuplicate: true, dateUnknown: wantsUnknown, date: wantsUnknown ? null : (patch.date ?? before.date) };
+  // تحقق كامل على نسخة تجريبية دون المساس بالحالة الأصلية
+  const trial = { ...state, payments: state.payments.filter((_, k) => k !== idx), log: [] };
+  const err = addPayment(trial, next, opts);
+  if (err) return err;
+  const added = trial.payments[trial.payments.length - 1];
+  const updated = { ...added, id: before.id, createdAt: before.createdAt, editedAt: nowIso() };
+  if (before.opId) updated.opId = before.opId; else delete updated.opId;
+  if (before.duplicateConfirmed) updated.duplicateConfirmed = true; else delete updated.duplicateConfirmed;
+  if (before.confirmedAt) updated.confirmedAt = before.confirmedAt;
+  state.payments[idx] = updated; // نفس الموضع، تعديل واحد فقط بعد نجاح كل التحقق
+  log(state, `تعديل دفعة — ${itemById(state, before.itemId)?.name}: ${fmtKD(before.amount)} ← ${fmtKD(updated.amount)} د.ك (${monthLabel(updated.month)}، ${dateLabel(updated.date)})`);
   return null;
 }
 
@@ -101,7 +124,10 @@ export function confirmPayment(state, id, date, today = kuwaitToday()) {
   const p = state.payments.find((x) => x.id === id);
   if (!p) return 'الدفعة غير موجودة';
   if (p.confirmed !== false) return 'الدفعة مؤكدة مسبقًا';
+  if (date !== undefined && date !== null && !okDate(date)) return 'التاريخ غير صالح';
   if ((date || p.date) > today) return FUTURE;
+  const item = itemById(state, p.itemId);
+  if (item?.type === 'debt' && p.amount > debtStatus(state, item).remaining) return `تأكيدها يتجاوز الرصيد المتبقي (${fmtKD(debtStatus(state, item).remaining)} د.ك) — عدّل المبلغ أولًا`;
   p.confirmed = true;
   if (date) p.date = date;
   p.confirmedAt = nowIso();
@@ -137,6 +163,9 @@ function monthData(state, month) {
 export function setPlan(state, month, itemId, amount) {
   const item = itemById(state, itemId);
   if (!item) return 'البند غير موجود';
+  if (!okMonth(month)) return 'الشهر غير صالح';
+  if (amount !== null && (!Number.isSafeInteger(amount) || amount < 0)) return 'المبلغ غير صالح';
+  if (amount === null && !state.months[month]?.plan?.hasOwnProperty(itemId)) return null;
   const md = monthData(state, month);
   if (amount === null) {
     delete md.plan[itemId];
@@ -150,13 +179,39 @@ export function setPlan(state, month, itemId, amount) {
   return null;
 }
 
+/**
+ * قاعدة تاريخ الاستحقاق لبند في خطة الشهر m (الالتزام يبقى في خطة m مهما كان التاريخ، فلا يُحتسب مرتين):
+ * - مسموح: من أول يوم في m حتى آخر يوم في m+1 (يغطي نافذة m التي تمتد لما قبل راتب m+1، مثل دفع
+ *   جزء من نوفمبر في 2 ديسمبر من بدل الإيجار).
+ * - خارج نافذة m (قبل يوم راتب m، أو بعد اليوم السابق لراتب m+1): مسموح مع تنبيه.
+ * - خارج النطاق: مرفوض — انقل المبلغ لخطة الشهر الصحيح بدل ذلك.
+ */
+export function dueDateCheck(state, month, date) {
+  if (!okMonth(month)) return { ok: false, error: 'الشهر غير صالح' };
+  if (!okDate(date)) return { ok: false, error: 'التاريخ غير صالح' };
+  const sd = state.settings.salaryDay;
+  const from = `${month}-01`;
+  const nextM = addMonths(month, 1);
+  const to = dateIn(nextM, daysInMonth(nextM));
+  if (date < from || date > to) return { ok: false, error: `تاريخ الاستحقاق يجب أن يكون بين ${dateLabel(from)} و${dateLabel(to)} لبند في خطة ${monthLabel(month)}. لتغيير الشهر انقل المبلغ لخطة الشهر الصحيح.` };
+  const winStart = dateIn(month, sd);
+  const winEnd = addDays(dateIn(nextM, sd), -1);
+  if (date < winStart) return { ok: true, warning: `الاستحقاق قبل نافذة ${monthLabel(month)} (تبدأ بالراتب ${dateLabel(winStart)}): يُدفع من رصيد سابق، وليس من دخل هذا الشهر.` };
+  if (date > winEnd) return { ok: true, warning: `الاستحقاق بعد نهاية نافذة ${monthLabel(month)} (${dateLabel(winEnd)}): يتزامن مع دخل الشهر التالي.` };
+  return { ok: true, warning: null };
+}
 export function setDueDate(state, month, itemId, date) {
+  if (!itemById(state, itemId)) return 'البند غير موجود';
+  if (!okMonth(month)) return 'الشهر غير صالح';
+  if (date) {
+    const c = dueDateCheck(state, month, date);
+    if (!c.ok) return c.error;
+  }
+  if (!date && !state.months[month]?.dueDates?.[itemId]) return null;
   const md = monthData(state, month);
   md.dueDates = md.dueDates || {};
-  if (!date) delete md.dueDates[itemId];
-  else if (!okDate(date)) return 'التاريخ غير صالح';
-  else md.dueDates[itemId] = date;
-  log(state, `تاريخ استحقاق — ${itemById(state, itemId)?.name} — ${monthLabel(month)}: ${date ? dateLabel(date) : 'بدون'}`);
+  if (!date) delete md.dueDates[itemId]; else md.dueDates[itemId] = date;
+  log(state, `تاريخ استحقاق — ${itemById(state, itemId)?.name} — خطة ${monthLabel(month)}: ${date ? dateLabel(date) : 'بدون'}`);
   return null;
 }
 
@@ -164,10 +219,12 @@ export function setDueDate(state, month, itemId, date) {
 export function setIncome(state, month, kind, patch, today = kuwaitToday()) {
   if (patch.received === true && patch.receivedDate && patch.receivedDate > today) return FUTURE;
   if (kind !== 'salary' && kind !== 'rent') return 'نوع الدخل غير صالح';
+  if (!okMonth(month)) return 'الشهر غير صالح';
+  if (patch.received === true && patch.receivedDate === undefined) return 'أدخل تاريخ الاستلام';
   if (patch.amount !== undefined && (!Number.isSafeInteger(patch.amount) || patch.amount < 0)) return 'المبلغ غير صالح';
   if (patch.date !== undefined && patch.date !== null && !okDate(patch.date)) return 'التاريخ غير صالح';
   if (patch.receivedAmount !== undefined && patch.receivedAmount !== null && (!Number.isSafeInteger(patch.receivedAmount) || patch.receivedAmount < 0)) return 'المبلغ المستلم غير صالح';
-  if (patch.receivedDate && !okDate(patch.receivedDate)) return 'تاريخ الاستلام غير صالح';
+  if (patch.receivedDate !== undefined && patch.receivedDate !== null && !okDate(patch.receivedDate)) return 'تاريخ الاستلام غير صالح';
   if (patch.allocMonth !== undefined) {
     if (kind !== 'rent') return 'التخصيص متاح لبدل الإيجار فقط';
     if (patch.allocMonth !== null && !okMonth(patch.allocMonth)) return 'شهر التخصيص غير صالح';
@@ -190,6 +247,7 @@ export function setIncome(state, month, kind, patch, today = kuwaitToday()) {
 /* ── الدخل الإضافي ── */
 
 export function addExtra(state, { month, name, amount, status = 'received', date }, today = kuwaitToday()) {
+  if (date !== undefined && date !== null && date !== '' && !okDate(date)) return 'التاريخ غير صالح';
   if (status === 'received' && date && date > today) return FUTURE;
   if (!okMonth(month)) return 'الشهر غير صالح';
   if (!okAmount(amount)) return 'أدخل مبلغًا أكبر من صفر';
@@ -204,8 +262,11 @@ export function updateExtra(state, id, patch, today = kuwaitToday()) {
   const e = state.extras.find((x) => x.id === id);
   if (!e) return 'غير موجود';
   const nx = { ...e, ...patch };
+  if (!okMonth(nx.month)) return 'الشهر غير صالح';
+  if (!['pending', 'adopted', 'received'].includes(nx.status)) return 'الحالة غير صالحة';
+  if (nx.date && !okDate(nx.date)) return 'التاريخ غير صالح';
   if (nx.status === 'received' && nx.date && nx.date > today) return FUTURE;
-  if (patch.amount !== undefined && !okAmount(patch.amount)) return 'أدخل مبلغًا أكبر من صفر';
+  if (!okAmount(nx.amount)) return 'أدخل مبلغًا أكبر من صفر';
   Object.assign(e, patch);
   log(state, `تعديل دخل إضافي — ${e.name}: ${fmtKD(e.amount)} د.ك (${statusLabel(e.status)})`);
   return null;
@@ -223,6 +284,12 @@ export function deleteExtra(state, id) {
 export function addItem(state, data) {
   const name = (data.name || '').trim();
   if (!name) return 'أدخل الاسم';
+  if (data.type !== 'debt' && data.type !== 'expense') return 'نوع البند غير صالح';
+  if (data.start && !okMonth(data.start)) return 'شهر البدء غير صالح';
+  if (data.once && !okMonth(data.once)) return 'الشهر غير صالح';
+  if (data.endMonth && !okMonth(data.endMonth)) return 'شهر الانتهاء غير صالح';
+  if (data.extra && !['allow', 'closeOnly', 'none'].includes(data.extra)) return 'نوع السداد الإضافي غير صالح';
+  if (data.mandatory !== undefined && data.mandatory !== 0 && (!Number.isSafeInteger(data.mandatory) || data.mandatory < 0)) return 'القسط غير صالح';
   const order = Math.max(0, ...state.items.map((i) => i.order)) + 1;
   if (data.type === 'debt') {
     if (!okAmount(data.opening)) return 'أدخل الرصيد الأصلي';
@@ -255,6 +322,10 @@ export function updateItem(state, id, patch) {
   if (patch.opening !== undefined && !okAmount(patch.opening)) return 'الرصيد غير صالح';
   if (patch.mandatory !== undefined && (!Number.isSafeInteger(patch.mandatory) || patch.mandatory < 0)) return 'القسط غير صالح';
   if (patch.dueDay !== undefined && patch.dueDay !== null && (!Number.isInteger(patch.dueDay) || patch.dueDay < 1 || patch.dueDay > 31)) return 'يوم الاستحقاق بين 1 و31';
+  if (patch.extra !== undefined && !['allow', 'closeOnly', 'none'].includes(patch.extra)) return 'نوع السداد الإضافي غير صالح';
+  if (patch.start !== undefined && !okMonth(patch.start)) return 'شهر البدء غير صالح';
+  if (patch.once !== undefined && patch.once !== null && !okMonth(patch.once)) return 'الشهر غير صالح';
+  if (patch.endMonth !== undefined && patch.endMonth !== null && patch.endMonth !== '' && !okMonth(patch.endMonth)) return 'شهر الانتهاء غير صالح';
   if (patch.opening !== undefined && it.type === 'debt') {
     const paid = state.payments.filter((p) => p.itemId === id).reduce((a, p) => a + p.amount, 0);
     const adj = state.adjustments.filter((a) => a.itemId === id).reduce((a, x) => a + x.delta, 0);
@@ -276,6 +347,7 @@ export function setExpenseFrom(state, id, from, amount) {
   const it = itemById(state, id);
   if (!it || it.type !== 'expense') return 'البند غير موجود';
   if (!Number.isSafeInteger(amount) || amount < 0) return 'المبلغ غير صالح';
+  if (!okMonth(from)) return 'الشهر غير صالح';
   it.schedule = (it.schedule || []).filter((s) => s.from !== from);
   it.schedule.push({ from, amount });
   log(state, `تعديل ${it.name} ابتداءً من ${monthLabel(from)}: ${fmtKD(amount)} د.ك`);
@@ -378,6 +450,7 @@ export function deleteVisaPayment(state, id) {
 }
 /** تثبيت كشف دورة معيّنة (أو إعادة تثبيته بعد تعديل عملياتها) */
 export function confirmStatement(state, cycleEnd, today = kuwaitToday()) {
+  if (!okDate(cycleEnd)) return 'التاريخ غير صالح';
   if (cycleEnd > today) return 'لم يحن موعد تثبيت هذا الكشف بعد';
   const sd = state.settings.visaStatementDay;
   const amount = state.visa.purchases.filter((p) => visaCycleEnd(p.date, sd) === cycleEnd).reduce((a, p) => a + p.amount, 0);
@@ -437,6 +510,7 @@ export function resetPayoffPriority(state) {
 /** إقفال الشهر يدويًا أو إعادة فتحه. عند الإقفال يصبح غير المسدد من خطة الشهر عجزًا مؤكدًا. */
 export function closeMonth(state, month, closed = true, date = kuwaitToday()) {
   if (!okMonth(month)) return 'الشهر غير صالح';
+  if (closed && !okDate(date)) return 'التاريخ غير صالح';
   if (!state.months[month]) state.months[month] = { plan: {} };
   const md = state.months[month];
   if (closed) { md.closed = true; md.closedAt = date; } else { md.closed = false; delete md.closedAt; }

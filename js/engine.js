@@ -732,7 +732,9 @@ export function runScenario(state, sc, today = kuwaitToday()) {
 
 /** يرفع البيانات المحفوظة إلى أحدث نموذج دون حذف أي دفعة أو رصيد أو كشف. يرجع { state, changed }. */
 export function migrate(input) {
-  const state = input;
+  // يعمل على نسخة: إن فشل الترحيل لأي سبب تبقى البيانات الأصلية كما هي (ولا تُحفظ نسخة نصف مرحّلة)
+  if (!input || typeof input !== 'object' || !Array.isArray(input.items) || !Array.isArray(input.payments)) throw new Error('بنية البيانات المحفوظة غير صالحة');
+  const state = JSON.parse(JSON.stringify(input));
   let changed = false;
   const from = state.schema || 1;
   const now = new Date().toISOString();
@@ -834,75 +836,107 @@ export function dueDayDate(state, itemId, month) {
  * في اليوم نفسه يدخل الدخل قبل الدفع. النتيجة لكل حالة نقص: التاريخ، البند، المبلغ الناقص.
  */
 export function dailyLedger(state, sim, today = kuwaitToday()) {
+  void today;
   const F = sim.F;
-  const events = [];
+  const sd = state.settings.salaryDay;
   const anchorDate = sim.anchorDate;
   const after = (d) => !!d && d > anchorDate;
   const lastKey = sim.months[sim.months.length - 1].key;
-  // الرصيد الافتتاحي
-  events.push({ date: addDays(anchorDate, 0), order: 0, amount: sim.anchorAmount, label: 'الرصيد النقدي' });
-  // الدخل
+  const reserves = state.reserves || [];
+  // ترتيب أحداث اليوم الواحد: دخل ← تمويل احتياطي ← حقائق مؤكدة ← استحقاقات ← إعادة الاحتياطي غير المستخدم
+  const ORD = { open: 0, income: 1, fund: 2, fact: 3, due: 4, release: 5 };
+  const events = [];
+  const push = (e) => events.push(e);
+  push({ type: 'open', date: anchorDate, amount: sim.anchorAmount, label: 'الرصيد النقدي' });
+
+  // ── الدخل بتاريخ وصوله
   for (let i = monthIndex(state.settings.planStart); i <= monthIndex(lastKey); i++) {
     const mk = monthKey(i);
     for (const [kind, inc] of [['salary', salaryFor(state, mk)], ['rent', rentFor(state, mk)]]) {
-      const alloc = inc.allocMonth;
       const date = inc.received ? inc.receivedDate : inc.date;
       const amt = inc.received ? inc.receivedAmount : inc.amount;
       if (!amt) continue;
-      if (inc.received ? !after(date) : alloc < F) continue;
-      events.push({ date: date < dateIn(F, 1) ? dateIn(F, 1) : date, order: 1, amount: amt, label: `${kind === 'rent' ? 'بدل إيجار' : 'راتب'} ${monthLabel(mk)}` });
+      if (inc.received ? !after(date) : inc.allocMonth < F) continue;
+      push({ type: 'income', date: date < dateIn(F, 1) ? dateIn(F, 1) : date, amount: amt, label: `${kind === 'rent' ? 'بدل إيجار' : 'راتب'} ${monthLabel(mk)}` });
     }
   }
   for (const e of state.extras) {
-    if (e.status === 'received' && after(e.date)) events.push({ date: e.date, order: 1, amount: e.amount, label: e.name });
-    if (e.status === 'adopted' && e.month >= F) events.push({ date: dateIn(e.month, 1), order: 1, amount: e.amount, label: e.name });
+    if (e.status === 'received' && after(e.date)) push({ type: 'income', date: e.date, amount: e.amount, label: e.name });
+    if (e.status === 'adopted' && e.month >= F) push({ type: 'income', date: dateIn(e.month, 1), amount: e.amount, label: e.name });
   }
-  for (const r of state.recurring || []) for (const m of sim.months) if (!m.past && r.start <= m.key && (!r.end || m.key <= r.end)) events.push({ date: dateIn(m.key, 1), order: 1, amount: r.amount, label: 'زيادة معتمدة' });
-  // الحقائق المؤكدة
-  for (const p of confirmedPayments(state)) if (after(p.date)) events.push({ date: p.date, order: 2, amount: -p.amount, label: `دفعة ${itemById(state, p.itemId)?.name || ''}`, fact: true, potItem: p.itemId, potMonth: p.month });
-  for (const p of state.visa.payments) if (p.cashMonth && after(p.date)) events.push({ date: p.date, order: 2, amount: -p.amount, label: 'سداد الفيزا', fact: true });
-  // الاحتياطيات: تُحجز من كل مصدر عند وصوله (أو بتاريخ الحجز المؤكد)
-  const potEvents = [];
-  for (const r of state.reserves || []) {
-    const f = reserveFunding(state, r);
+  for (const r of state.recurring || []) for (const m of sim.months) if (!m.past && r.start <= m.key && (!r.end || m.key <= r.end)) push({ type: 'income', date: dateIn(m.key, 1), amount: r.amount, label: 'زيادة معتمدة' });
+
+  // ── تمويل الاحتياطيات: لكل احتياطي رصيد مستقل، يُضاف التمويل يوم وصوله فقط
+  for (const r of reserves) {
     if (r.heldDate) {
-      if (after(r.heldDate)) events.push({ date: r.heldDate, order: 2, amount: -r.amount, label: `حجز ${r.name}`, fact: true });
-      potEvents.push({ date: r.heldDate, r, amount: r.amount });
+      // حجز مؤكد: يدخل الاحتياطي بتاريخه، ويخرج من النقد فقط إن كان بعد الرصيد المُدخل
+      push({ type: 'fund', date: r.heldDate, r: r.id, potIn: r.amount, amount: after(r.heldDate) ? -r.amount : 0, label: `حجز ${r.name}` });
     } else if (r.month >= F) {
-      for (const src of f.sources) {
-        events.push({ date: src.date, order: 3, amount: -src.amount, label: `حجز ${r.name} من ${src.kind === 'rent' ? 'بدل الإيجار' : 'الراتب'}`, hold: true, r });
-        potEvents.push({ date: src.date, r, amount: src.amount });
+      for (const src of reserveFunding(state, r).sources) {
+        push({ type: 'fund', date: src.date, r: r.id, potIn: src.amount, amount: -src.amount, label: `حجز ${r.name} من ${src.kind === 'rent' ? 'بدل الإيجار' : 'الراتب'}`, hold: true });
       }
     }
+    // ما لم يُستخدم يعود للنقد بعد نافذة شهر الاستخدام (كما في المحرك الشهري)
+    if (r.targetMonth >= F) push({ type: 'release', date: addDays(dateIn(addMonths(r.targetMonth, 1), sd), -1), r: r.id, label: `إعادة غير المستخدم من ${r.name}` });
   }
-  // الالتزامات المتوقعة بتواريخ استحقاقها
+  const reservesFor = (itemId, month) => reserves.filter((r) => r.targetItem === itemId && r.targetMonth === month).map((r) => r.id);
+
+  // ── الحقائق المؤكدة (ما يُغطى من احتياطي البند نفسه لا يُخصم من النقد مرة ثانية)
+  for (const p of confirmedPayments(state)) {
+    if (!p.date) continue;
+    push({ type: 'fact', date: p.date, gross: p.amount, cashable: after(p.date), pots: reservesFor(p.itemId, p.month), label: `دفعة ${itemById(state, p.itemId)?.name || ''}` });
+  }
+  for (const p of state.visa.payments) if (p.cashMonth && after(p.date)) push({ type: 'fact', date: p.date, gross: p.amount, cashable: true, pots: [], label: 'سداد الفيزا' });
+
+  // ── الاستحقاقات المتوقعة بتواريخها (لا يُخترع تاريخ)
   const undated = [];
   for (const m of sim.months) {
     if (m.past) continue;
     for (const l of m.lines) {
-      const cashPart = (l.regRealized && l.carry ? 0 : Math.max(0, l.projReg - Math.max(0, l.potCover - Math.min(l.potCover, l.paidReg)))) + l.projArr;
       const potPart = Math.max(0, l.potCover - Math.min(l.potCover, l.paidReg));
+      const cashPart = (l.regRealized && l.carry ? 0 : Math.max(0, l.projReg - potPart)) + l.projArr;
       if (cashPart + potPart <= 0) continue;
       const due = state.months[m.key]?.dueDates?.[l.id] || dueDayDate(state, l.id, m.key);
       if (!due) { undated.push({ month: m.key, id: l.id, name: l.name, amount: cashPart + potPart }); continue; }
-      if (cashPart > 0) events.push({ date: due, order: 4, amount: -cashPart, label: `${l.name} (${monthLabel(m.key)})`, due: true, month: m.key, id: l.id });
-      if (potPart > 0) events.push({ date: due, order: 4, amount: 0, potNeed: potPart, label: `${l.name} من الاحتياطي (${monthLabel(m.key)})`, due: true, month: m.key, id: l.id });
+      push({ type: 'due', date: due, cash: cashPart, potNeed: potPart, pots: reservesFor(l.id, m.key), label: `${l.name} (${monthLabel(m.key)})`, month: m.key, id: l.id });
     }
   }
-  events.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.order - b.order));
-  potEvents.sort((a, b) => (a.date < b.date ? -1 : 1));
+
+  events.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : ORD[a.type] - ORD[b.type]));
+  const pot = Object.fromEntries(reserves.map((r) => [r.id, 0]));
+  const potLog = Object.fromEntries(reserves.map((r) => [r.id, []]));
+  const usePots = (ids, need) => { // يخصم من رصيد احتياطيات البند نفسه فقط
+    let got = 0;
+    for (const id of ids) { const x = Math.min(pot[id], need - got); if (x > 0) { pot[id] -= x; got += x; } }
+    return got;
+  };
   let bal = 0; let min = Infinity; let minDate = null;
   const shortfalls = [];
   for (const e of events) {
-    bal += e.amount;
-    if (e.potNeed) {
-      const avail = potEvents.filter((x) => x.date <= e.date).reduce((a, x) => a + x.amount, 0);
-      if (avail < e.potNeed) shortfalls.push({ date: e.date, label: e.label, short: e.potNeed - avail, reserve: true, month: e.month, id: e.id });
+    if (e.type === 'open' || e.type === 'income') bal += e.amount;
+    else if (e.type === 'fund') {
+      bal += e.amount; pot[e.r] += e.potIn;
+      potLog[e.r].push({ date: e.date, in: e.potIn, balance: pot[e.r] });
+      if (bal < 0 && e.hold) shortfalls.push({ date: e.date, label: e.label, short: -bal });
+    } else if (e.type === 'fact') {
+      const covered = usePots(e.pots, e.gross);
+      for (const id of e.pots) potLog[id].push({ date: e.date, out: covered, balance: pot[id] });
+      if (e.cashable) bal -= e.gross - covered;
+    } else if (e.type === 'due') {
+      if (e.potNeed > 0) {
+        const got = usePots(e.pots, e.potNeed);
+        for (const id of e.pots) potLog[id].push({ date: e.date, out: got, balance: pot[id] });
+        if (got < e.potNeed) shortfalls.push({ date: e.date, label: `${e.label} من الاحتياطي`, short: e.potNeed - got, reserve: true, month: e.month, id: e.id });
+      }
+      bal -= e.cash;
+      if (bal < 0 && e.cash > 0) shortfalls.push({ date: e.date, label: e.label, short: Math.min(e.cash, -bal), month: e.month, id: e.id });
+    } else if (e.type === 'release') {
+      if (pot[e.r] > 0) { bal += pot[e.r]; potLog[e.r].push({ date: e.date, out: pot[e.r], released: true, balance: 0 }); pot[e.r] = 0; }
     }
+    e.balAfter = bal;
     if (bal < min) { min = bal; minDate = e.date; }
-    if (bal < 0 && (e.due || e.hold)) shortfalls.push({ date: e.date, label: e.label, short: -bal, month: e.month, id: e.id });
   }
-  return { status: shortfalls.length ? 'shortfall' : undated.length ? 'unresolved' : 'ok', shortfalls, undated, minBalance: min === Infinity ? 0 : min, minDate, events };
+  return { status: shortfalls.length ? 'shortfall' : undated.length ? 'unresolved' : 'ok', shortfalls, undated, minBalance: min === Infinity ? 0 : min, minDate, events, potLog };
 }
 
 export function planReliability(state, sim, today = kuwaitToday()) {

@@ -315,6 +315,7 @@ test('خصائص: آلاف العمليات العشوائية — الثواب�
       const items = st.items.map((i) => i.id);
       const k = Math.floor(R() * 16);
       let err = null;
+      const beforeOp = JSON.stringify(st);
       const m = pick(MONTHS);
       switch (k) {
         case 0: case 1: case 2: { // دفعة أساسية جزئية/كاملة/زائدة
@@ -341,7 +342,7 @@ test('خصائص: آلاف العمليات العشوائية — الثواب�
         case 14: err = A.setVerified(st, pick(['p_suhail', 'p_shafiq', 'p_electric', 'p_abuosama']), R() > 0.5); break;
         default: err = A.setPlan(st, m, pick(items), R() > 0.2 ? amt(1500000) : null); break;
       }
-      if (err) rejected++; else accepted++;
+      if (err) { rejected++; assert.equal(JSON.stringify(st), beforeOp, `seq${seq} op${op} k${k}: عملية مرفوضة (${err}) غيّرت الحالة`); } else accepted++;
       audit(st, today, `seq${seq} op${op} k${k}`);
       checks++;
     }
@@ -425,7 +426,8 @@ test('يومي: عدة التزامات قبل وصول الراتب، أو تق
   let d = E.dailyLedger(st, E.simulate(st, { today: T }), T);
   const s = d.shortfalls.filter((x) => x.date === '2026-11-10');
   assert.ok(s.length >= 1);
-  assert.equal(s[s.length - 1].short, KD(630), '460 + 170 مستحقة قبل وصول المال');
+  assert.deepEqual(s.map((x) => [x.id, x.short]), [['furniture', KD(460)], ['small', KD(170)]], 'النقص لكل التزام');
+  assert.equal(s.reduce((a, x) => a + x.short, 0), KD(630), '460 + 170 مستحقة قبل وصول المال');
   // مع رصيد نقدي كافٍ مُدخل: لا نقص
   ok(A.setCash(st, { amount: KD(700), date: '2026-11-05' }, T));
   d = E.dailyLedger(st, E.simulate(st, { today: T }), T);
