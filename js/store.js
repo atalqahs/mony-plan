@@ -17,8 +17,12 @@ function openDb() {
 let dbp = null;
 const db = () => (dbp ||= openDb());
 
+/**
+ * يرجع { state, unreadable }. unreadable=true يعني وجود بيانات تعذرت قراءتها:
+ * في هذه الحالة لا يجوز إنشاء بيانات جديدة فوقها.
+ */
 export async function loadState() {
-  let fromIdb = null;
+  let fromIdb = null; let idbError = false;
   try {
     const d = await db();
     fromIdb = await new Promise((res, rej) => {
@@ -26,12 +30,25 @@ export async function loadState() {
       r.onsuccess = () => res(r.result || null);
       r.onerror = () => rej(r.error);
     });
-  } catch { /* fallback */ }
-  let fromLs = null;
-  try { const raw = localStorage.getItem(LS_KEY); if (raw) fromLs = JSON.parse(raw); } catch { /* ignore */ }
-  // اختر الأحدث
-  if (fromIdb && fromLs) return (fromLs.savedAt || '') > (fromIdb.savedAt || '') ? fromLs : fromIdb;
-  return fromIdb || fromLs;
+  } catch { idbError = true; }
+  let fromLs = null; let lsCorrupt = false;
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (raw) {
+      try { fromLs = JSON.parse(raw); } catch {
+        lsCorrupt = true;
+        // نحتفظ بنسخة من النص التالف بدل حذفه
+        try { localStorage.setItem(`${LS_KEY}-unreadable-${Date.now()}`, raw); } catch { /* quota */ }
+      }
+    }
+  } catch { /* localStorage unavailable */ }
+  const valid = (x) => x && typeof x === 'object' && Array.isArray(x.items) && Array.isArray(x.payments);
+  if (!valid(fromIdb)) fromIdb = null;
+  if (!valid(fromLs)) fromLs = null;
+  let state = null;
+  if (fromIdb && fromLs) state = (fromLs.savedAt || '') > (fromIdb.savedAt || '') ? fromLs : fromIdb;
+  else state = fromIdb || fromLs;
+  return { state, unreadable: !state && (lsCorrupt || idbError) };
 }
 
 let pending = null;

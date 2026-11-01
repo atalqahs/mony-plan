@@ -30,9 +30,11 @@
 ## التشغيل والاختبار
 ```bash
 python3 -m http.server 8765      # ثم افتح http://localhost:8765
-npm test                          # اختبارات المحرك (node:test)
+npm test                          # المحرك + التدقيق (مطابقة المحرك المستقل، حالات خطرة، آلاف الحالات العشوائية)
+npm run report                    # يولّد docs/AUDIT-SCHEDULE.md (جدول السداد الكامل ومطابقة المحركين)
 npm run test:e2e                  # اختبار الواجهة (Playwright، يحتاج الخادم أعلاه)
 ```
+محرك التحقق المستقل: `tests/verifier.mjs`. تقرير التدقيق: `docs/AUDIT-REPORT.md`.
 
 ## النشر على GitHub Pages
 الملف `.github/workflows/pages.yml` يشغّل الاختبارات وينشر الموقع، ويعمل يدويًا فقط (Actions ← Run workflow). قبل أول نشر فعّل:

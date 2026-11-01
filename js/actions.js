@@ -10,6 +10,7 @@ function log(state, text) { state.log.push({ ts: nowIso(), text }); }
 const okAmount = (a) => Number.isSafeInteger(a) && a > 0;
 const okDate = (d) => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d);
 const okMonth = (m) => typeof m === 'string' && /^\d{4}-\d{2}$/.test(m);
+const FUTURE = 'تاريخ عملية مؤكدة لا يمكن أن يكون في المستقبل — سجّلها غير مؤكدة أو صحّح التاريخ';
 
 /* ── الدفعات ── */
 
@@ -24,6 +25,7 @@ export function addPayment(state, { itemId, month, kind = 'regular', amount, dat
   if (!okAmount(amount)) return 'أدخل مبلغًا أكبر من صفر';
   if (!okDate(date)) return 'التاريخ غير صالح';
   if (kind !== 'regular' && kind !== 'arrears') return 'نوع الدفعة غير صالح';
+  if (confirmed && date > (opts.today || kuwaitToday())) return FUTURE;
   if (item.type === 'debt') {
     const st = debtStatus(state, item);
     const free = st.remaining - st.pending; // نحتسب الدفعات المسجلة غير المؤكدة لمنع تجاوز الرصيد
@@ -74,10 +76,11 @@ export function updatePayment(state, id, patch, opts = {}) {
   return null;
 }
 
-export function confirmPayment(state, id, date) {
+export function confirmPayment(state, id, date, today = kuwaitToday()) {
   const p = state.payments.find((x) => x.id === id);
   if (!p) return 'الدفعة غير موجودة';
   if (p.confirmed !== false) return 'الدفعة مؤكدة مسبقًا';
+  if ((date || p.date) > today) return FUTURE;
   p.confirmed = true;
   if (date) p.date = date;
   p.confirmedAt = nowIso();
@@ -137,7 +140,8 @@ export function setDueDate(state, month, itemId, date) {
 }
 
 /** الدخل: kind = salary | rent. patch: {amount, date, received, receivedDate} */
-export function setIncome(state, month, kind, patch) {
+export function setIncome(state, month, kind, patch, today = kuwaitToday()) {
+  if (patch.received === true && patch.receivedDate && patch.receivedDate > today) return FUTURE;
   if (kind !== 'salary' && kind !== 'rent') return 'نوع الدخل غير صالح';
   if (patch.amount !== undefined && (!Number.isSafeInteger(patch.amount) || patch.amount < 0)) return 'المبلغ غير صالح';
   if (patch.date !== undefined && patch.date !== null && !okDate(patch.date)) return 'التاريخ غير صالح';
@@ -164,7 +168,8 @@ export function setIncome(state, month, kind, patch) {
 
 /* ── الدخل الإضافي ── */
 
-export function addExtra(state, { month, name, amount, status = 'received', date }) {
+export function addExtra(state, { month, name, amount, status = 'received', date }, today = kuwaitToday()) {
+  if (status === 'received' && date && date > today) return FUTURE;
   if (!okMonth(month)) return 'الشهر غير صالح';
   if (!okAmount(amount)) return 'أدخل مبلغًا أكبر من صفر';
   if (!['pending', 'adopted', 'received'].includes(status)) return 'الحالة غير صالحة';
@@ -174,9 +179,11 @@ export function addExtra(state, { month, name, amount, status = 'received', date
   return null;
 }
 export const statusLabel = (s) => ({ pending: 'غير مؤكد', adopted: 'معتمد بالخطة', received: 'مستلم' }[s]);
-export function updateExtra(state, id, patch) {
+export function updateExtra(state, id, patch, today = kuwaitToday()) {
   const e = state.extras.find((x) => x.id === id);
   if (!e) return 'غير موجود';
+  const nx = { ...e, ...patch };
+  if (nx.status === 'received' && nx.date && nx.date > today) return FUTURE;
   if (patch.amount !== undefined && !okAmount(patch.amount)) return 'أدخل مبلغًا أكبر من صفر';
   Object.assign(e, patch);
   log(state, `تعديل دخل إضافي — ${e.name}: ${fmtKD(e.amount)} د.ك (${statusLabel(e.status)})`);
@@ -291,8 +298,9 @@ export function confirmClose(state, itemId, value = true) {
 
 /* ── الفيزا ── */
 
-export function addVisaPurchase(state, { date, amount, note = '' }) {
+export function addVisaPurchase(state, { date, amount, note = '' }, today = kuwaitToday()) {
   if (!okDate(date)) return 'التاريخ غير صالح';
+  if (date > today) return FUTURE;
   if (!okAmount(amount)) return 'أدخل مبلغًا أكبر من صفر';
   const vs = visaSummary(state);
   if (amount > vs.available) return `المبلغ يتجاوز الحد المتاح (${fmtKD(Math.max(0, vs.available))} د.ك)`;
@@ -301,9 +309,10 @@ export function addVisaPurchase(state, { date, amount, note = '' }) {
   log(state, `فيزا — شراء ${fmtKD(amount)} د.ك بتاريخ ${dateLabel(date)} (كشف ${dateLabel(visaCycleEnd(date, state.settings.visaStatementDay))})${note ? ` — ${note}` : ''}`);
   return null;
 }
-export function updateVisaPurchase(state, id, patch) {
+export function updateVisaPurchase(state, id, patch, today = kuwaitToday()) {
   const p = state.visa.purchases.find((x) => x.id === id);
   if (!p) return 'غير موجود';
+  if (patch.date && patch.date > today) return FUTURE;
   if (patch.date !== undefined && !okDate(patch.date)) return 'التاريخ غير صالح';
   if (patch.amount !== undefined && !okAmount(patch.amount)) return 'أدخل مبلغًا أكبر من صفر';
   if (patch.amount !== undefined) {
@@ -322,8 +331,9 @@ export function deleteVisaPurchase(state, id) {
   log(state, `فيزا — حذف شراء ${fmtKD(p.amount)} د.ك (${dateLabel(p.date)})`);
   return null;
 }
-export function addVisaPayment(state, { date, amount, note = '', cashMonth }, today) {
+export function addVisaPayment(state, { date, amount, note = '', cashMonth }, today = kuwaitToday()) {
   if (!okDate(date)) return 'التاريخ غير صالح';
+  if (date > today) return FUTURE;
   if (!okAmount(amount)) return 'أدخل مبلغًا أكبر من صفر';
   const vs = visaSummary(state, today);
   if (amount > vs.used) return `المبلغ أكبر من المستخدم غير المسدد (${fmtKD(vs.used)} د.ك)`;
@@ -420,10 +430,11 @@ export function setCash(state, { amount, date, note = '' }, today = kuwaitToday(
 }
 
 /** تأكيد حجز احتياطي (date) أو إلغاؤه (null) */
-export function holdReserve(state, id, date) {
+export function holdReserve(state, id, date, today = kuwaitToday()) {
   const r = (state.reserves || []).find((x) => x.id === id);
   if (!r) return 'الاحتياطي غير موجود';
   if (date !== null && !okDate(date)) return 'التاريخ غير صالح';
+  if (date && date > today) return FUTURE;
   r.heldDate = date;
   log(state, `${r.name}: ${date ? `تأكيد حجز ${fmtKD(r.amount)} د.ك بتاريخ ${dateLabel(date)}` : 'إلغاء تأكيد الحجز'}`);
   return null;
@@ -448,4 +459,12 @@ export function setVerified(state, id, value) {
   d.verified = !!value;
   log(state, `${d.name}: ${value ? 'مستحق فعلًا — يدخل الجدولة' : 'بانتظار التحقق — خارج الجدولة'}`);
   return null;
+}
+
+/** كشف التكرار: دفعة مطابقة (البند، الشهر، النوع، المبلغ، التاريخ) — للتنبيه قبل الحفظ */
+export function findDuplicatePayment(state, { itemId, month, kind = 'regular', amount, date }) {
+  return state.payments.find((p) => p.itemId === itemId && p.month === month && p.kind === kind && p.amount === amount && p.date === date) || null;
+}
+export function findDuplicateVisaPayment(state, { amount, date }) {
+  return state.visa.payments.find((p) => p.amount === amount && p.date === date) || null;
 }

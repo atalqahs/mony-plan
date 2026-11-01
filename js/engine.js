@@ -255,6 +255,10 @@ export function simulate(state, opts = {}) {
   const pendingMap = sumBy(baseline ? [] : state.payments.filter((p) => p.confirmed === false), (p) => `${p.month}|${p.itemId}|${p.kind}`);
   // التصحيحات تُخزن كفرق (delta)
   const adjMap = sumBy(baseline ? [] : state.adjustments.map((a) => ({ itemId: a.itemId, amount: a.delta })), (a) => a.itemId);
+  // مجموع الدفعات المؤكدة لكل دين في الأشهر التالية لشهر معيّن (حقائق مستقبلية في الجدول)
+  const paidByDebt = new Map();
+  for (const p of confirmed) { if (!paidByDebt.has(p.itemId)) paidByDebt.set(p.itemId, []); paidByDebt.get(p.itemId).push(p); }
+  const laterPaidOf = (id, m) => (paidByDebt.get(id) || []).reduce((a, p) => a + (p.month > m ? p.amount : 0), 0);
   const priority = s.payoffPriority || DEFAULT_PRIORITY;
   const prioRank = (item) => { const i = priority.indexOf(item.id); return i < 0 ? 1e6 + item.order : i; };
 
@@ -278,6 +282,39 @@ export function simulate(state, opts = {}) {
   for (const d of debts) { bal[d.id] = null; arrC[d.id] = 0; arrP[d.id] = 0; }
   for (const e of expenses) { arrC[e.id] = 0; arrP[e.id] = 0; }
   for (const r of reserves) pot[r.id] = 0;
+
+  // ── توقيت الدخل: لا يُستعمل مال قبل وصوله.
+  // نافذة الشهر المالي m تبدأ يوم الراتب الافتراضي وتنتهي قبل راتب الشهر التالي؛ لذلك بدل إيجار نوفمبر
+  // الذي يصل 1–2 ديسمبر يقع ضمن نافذة نوفمبر، أما إن تأخر إلى ما بعد راتب ديسمبر فينتقل لنافذة ديسمبر.
+  // شهر الأثر النقدي = الأحدث بين (الشهر المخصص له) و(نافذة تاريخ وصوله).
+  const windowOf = (date) => { const m = monthOfDate(date); return Number(date.slice(8, 10)) >= s.salaryDay ? m : addMonths(m, -1); };
+  const incomeCashMap = new Map();
+  const timing = [];
+  const routeIncome = (alloc, item, kind, ofMonth) => {
+    const useReceived = !baseline && item.received;
+    const date = useReceived ? item.receivedDate : item.date;
+    const amt = useReceived ? item.receivedAmount : item.amount;
+    if (!amt) return;
+    let target = alloc;
+    const w = windowOf(date);
+    if (w > target) target = w;
+    if (useReceived) {
+      if (!afterAnchor(date)) return; // مُضمَّن في الرصيد النقدي المُدخل
+      if (target < F) target = F;
+    } else if (alloc < F) return; // دخل متوقع لشهر ماضٍ: مجهول، لا يُحتسب سيولة
+    incomeCashMap.set(target, (incomeCashMap.get(target) || 0) + amt);
+    if (target > alloc) timing.push({ kind, ofMonth, alloc, cashMonth: target, date, amount: amt, received: useReceived });
+  };
+  let routedTo = startIdx - 1;
+  const routeUpTo = (idx) => {
+    while (routedTo < idx) {
+      routedTo += 1;
+      const mk = monthKey(routedTo);
+      routeIncome(mk, salaryFor(state, mk), 'salary', mk);
+      const r = rentFor(state, mk);
+      routeIncome(r.allocMonth, r, 'rent', mk);
+    }
+  };
 
   let cash = 0;
   let endIdx = null;
@@ -310,22 +347,9 @@ export function simulate(state, opts = {}) {
     if (idx === Fidx) cash = anchorAmount;
     const cashBefore = forecast ? cash : null;
     let incomeCash = 0;
+    routeUpTo(idx + 24);
     if (forecast) {
-      const incomeItems = [sal, ...rents];
-      for (const it of incomeItems) {
-        if (baseline || !it.received) incomeCash += it.amount; // متوقع (غير مستلم)
-        else if (afterAnchor(it.receivedDate)) incomeCash += it.receivedAmount; // مستلم بعد الارتكاز
-      }
-      incomeCash += adopted + recurringAmt + virtualAmt;
-      // الدخل المستلم لأشهر ماضية بعد الارتكاز يدخل الشهر الحالي
-      if (!baseline && idx === Fidx) {
-        for (let j = startIdx; j < Fidx; j++) {
-          const pk = monthKey(j);
-          for (const it of [salaryFor(state, pk), ...rentsAllocatedTo(state, pk)]) {
-            if (it.received && afterAnchor(it.receivedDate)) incomeCash += it.receivedAmount;
-          }
-        }
-      }
+      incomeCash = (incomeCashMap.get(key) || 0) + adopted + recurringAmt + virtualAmt;
       cash += incomeCash + (cashAdj.get(key) || 0);
     }
 
@@ -342,10 +366,13 @@ export function simulate(state, opts = {}) {
       const paidReg = payMap.get(kR) || 0; const paidArr = payMap.get(kA) || 0;
       const pendingReg = pendingMap.get(kR) || 0;
       if (balStart <= 0 && paidReg === 0 && paidArr === 0) continue; // مغلق: لا مطالبات
-      const arrCs = Math.max(0, Math.min(arrC[d.id], balStart));
-      const arrPs = Math.max(0, Math.min(arrP[d.id], balStart - arrCs));
+      // الدفعات المؤكدة لأشهر لاحقة حقائق ستُخصم من الرصيد؛ لا يُجدول هنا ما يتجاوز المتبقي بعدها
+      const room = Math.max(0, balStart - laterPaidOf(d.id, key));
+      const arrCs = Math.max(0, Math.min(arrC[d.id], room));
+      const arrPs = Math.max(0, Math.min(arrP[d.id], room - arrCs));
       const arrStart = arrCs + arrPs;
-      const dueCap = Math.max(0, balStart - arrStart);
+      // ما يدفع من العجز (المتبقي أو ما دُفع منه فعلًا إن زاد) لا يُستعمل للقسط الأساسي
+      const dueCap = Math.max(0, room - Math.max(arrStart, paidArr));
       const unverified = isUnverifiedPerson(d);
       const stored = Object.prototype.hasOwnProperty.call(planVals, d.id) ? planVals[d.id] : null;
       const mandatoryCap = Math.min(d.mandatory || 0, dueCap);
@@ -358,7 +385,7 @@ export function simulate(state, opts = {}) {
       lines.push(mkLine({
         id: d.id, type: 'debt', group: d.group, name: d.name, icon: d.icon, item: d, unverified,
         mandatory: d.mandatory || 0, mandatoryCap, stored, engineManaged,
-        balStart, arrStart, arrStartC: arrCs, arrStartP: arrPs, dueCap, planned,
+        balStart, room, arrStart, arrStartC: arrCs, arrStartP: arrPs, dueCap, planned,
         plannedForDeficit: engineManaged ? mandatoryCap : planned,
         paidReg, paidArr, pendingReg,
         regCash: payCashMap.get(kR) || 0, arrCash: payCashMap.get(kA) || 0,
@@ -456,7 +483,8 @@ export function simulate(state, opts = {}) {
       // د) العجز المرحّل (المؤكد أولًا ثم المتوقع)
       for (const l of [...lines.filter((x) => x.type === 'expense'), ...lines.filter((x) => x.type === 'debt')]) {
         if (l.arrRealized || l.arrStart <= 0) continue;
-        l.projArr = take(l.arrStart);
+        const need = l.type === 'debt' ? Math.min(l.arrStart, Math.max(0, l.room - l.paidReg - l.projReg)) : l.arrStart;
+        l.projArr = take(need);
       }
       // هـ) الفائض حسب أولويات السداد (أشهر الجدولة التلقائية فقط)
       if (isAuto && !closed) {
@@ -552,6 +580,7 @@ export function simulate(state, opts = {}) {
     .filter((x) => x.remaining > 0);
   return {
     months, F, anchorDate, anchorAmount,
+    timing: timing.filter((t) => t.alloc <= monthKey(Math.max(startIdx, endIdx ?? routedTo))),
     endMonth: endIdx === null ? null : monthKey(endIdx),
     byKey: Object.fromEntries(months.map((m) => [m.key, m])),
     excludedPersons,
@@ -767,9 +796,17 @@ export function planReliability(state, sim, today = kuwaitToday()) {
   const inferred = debtsOf(state).filter((d) => d.openingInferred);
   const pendingExtras = state.extras.filter((e) => e.status === 'pending');
   const historyIncomplete = unknownPast.length > 0;
+  // دخل متوقع تجاوز موعده دون تأكيد، ودخل يصل بعد نافذة شهره
+  const overdueIncome = [];
+  for (const m of sim.months) {
+    if (!m.forecast) continue;
+    const items = [{ kind: 'salary', ofMonth: m.key, x: m.income.salary }, ...m.income.rents.map((r) => ({ kind: 'rent', ofMonth: r.ofMonth, x: r }))];
+    for (const it of items) if (!it.x.received && it.x.amount > 0 && it.x.date < today) overdueIncome.push({ kind: it.kind, ofMonth: it.ofMonth, date: it.x.date, amount: it.x.amount });
+  }
+  const timing = (sim.timing || []).filter((t) => t.alloc >= sim.F);
   return {
-    unknownPast, gaps, futureIncomeUnconfirmed, inferred, pendingExtras, historyIncomplete,
+    unknownPast, gaps, overdueIncome, timing, futureIncomeUnconfirmed, inferred, pendingExtras, historyIncomplete,
     cashEntered, cashStale, excludedPersons: sim.excludedPersons,
-    reliable: !!sim.endMonth && gaps.length === 0 && !historyIncomplete && cashEntered && !cashStale,
+    reliable: !!sim.endMonth && gaps.length === 0 && !historyIncomplete && cashEntered && !cashStale && overdueIncome.length === 0,
   };
 }

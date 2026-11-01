@@ -12,7 +12,9 @@ const fresh = () => E.createSeedState('2026-11-01T00:00:00.000Z');
 const sim = (st, o = {}) => E.simulate(st, { today: TODAY, ...o });
 const line = (st, month, id, o = {}) => sim(st, { until: month, ...o }).byKey[month].lines.find((l) => l.id === id);
 const ok = (err) => assert.equal(err, null, err);
-const pay = (st, itemId, month, amount, date, extra = {}) => ok(A.addPayment(st, { itemId, month, amount: KD(amount), date, ...extra }, { today: extra.today || TODAY }));
+// وقت التسجيل = تاريخ الدفعة إن كان بعد TODAY (العملية المؤكدة لا تكون في المستقبل)
+const at = (date) => (date > TODAY ? date : TODAY);
+const pay = (st, itemId, month, amount, date, extra = {}) => ok(A.addPayment(st, { itemId, month, amount: KD(amount), date, ...extra }, { today: extra.today || at(date) }));
 const remaining = (st) => E.dashboard(st, sim(st)).remaining;
 const PLAN = {
   '2026-09': { furniture: 460, violations: 537.8, small: 170 },
@@ -108,8 +110,8 @@ test('[4] لا يُرحّل فائض سبتمبر وأكتوبر الافترا�
   assert.equal(s.byKey['2026-11'].cashStart, 0, 'بداية نوفمبر = الرصيد النقدي المُدخل (صفر)');
   // حتى بعد تسجيل كل دفعات سبتمبر وأكتوبر وتأكيد الرواتب: لا سيولة تاريخية
   for (const [m, vals] of Object.entries(PLAN)) for (const [id, v] of Object.entries(vals)) pay(st, id, m, v, `${m}-25`);
-  ok(A.setIncome(st, '2026-09', 'salary', { received: true, receivedDate: '2026-09-22' }));
-  ok(A.setIncome(st, '2026-10', 'salary', { received: true, receivedDate: '2026-10-22' }));
+  ok(A.setIncome(st, '2026-09', 'salary', { received: true, receivedDate: '2026-09-22' }, at('2026-09-22')));
+  ok(A.setIncome(st, '2026-10', 'salary', { received: true, receivedDate: '2026-10-22' }, at('2026-10-22')));
   assert.equal(sim(st).byKey['2026-11'].cashStart, 0);
   // السيولة تأتي فقط من رصيد يُدخله المستخدم
   ok(A.setCash(st, { amount: KD(300), date: '2026-11-01' }, TODAY));
@@ -172,7 +174,7 @@ test('[7] ترحيل العجز 340 ثم 140 ثم 90، والقسط الأساس
   pay(st, 'violations', '2027-01', 100, '2027-01-24');
   assert.equal(line(st, '2027-02', 'violations').arrStartC, KD(90) + KD('152.150'));
   // لا يمكن سداد أكثر من العجز
-  assert.notEqual(A.addPayment(st, { itemId: 'violations', month: '2027-02', kind: 'arrears', amount: KD(243), date: '2027-02-23' }, { today: TODAY }), null);
+  assert.notEqual(A.addPayment(st, { itemId: 'violations', month: '2027-02', kind: 'arrears', amount: KD(243), date: '2027-02-23' }, { today: at('2027-02-23') }), null);
 });
 
 /* ───────── [8] لا خصم مزدوج للعجز ───────── */
@@ -202,7 +204,7 @@ test('[9] إغلاق الأثاث كاملًا يلغي قسطه فورًا', ()
   const s = sim(st, { until: '2027-04' });
   assert.equal(E.debtStatus(st, E.itemById(st, 'furniture')).remaining, 0);
   for (const k of ['2026-12', '2027-01', '2027-02', '2027-03']) assert.equal(s.byKey[k].lines.find((l) => l.id === 'furniture'), undefined, k);
-  assert.notEqual(A.addPayment(st, { itemId: 'furniture', month: '2026-12', amount: 1, date: '2026-12-25' }, { today: TODAY }), null, 'لا دفع زائد');
+  assert.notEqual(A.addPayment(st, { itemId: 'furniture', month: '2026-12', amount: 1, date: '2026-12-25' }, { today: at('2026-12-25') }), null, 'لا دفع زائد');
 });
 test('[10] إغلاق المخالفات كاملًا يلغي قسطها فورًا، والقسط لا يتجاوز الرصيد', () => {
   const st = fresh();
@@ -231,7 +233,7 @@ test('[11] تحرير قسط بإغلاق قرض لا يُحسب دخلًا جد
 /* ───────── [12] بدل الإيجار مرة واحدة ───────── */
 test('[12] بدل الإيجار يُحتسب مرة واحدة فقط، وتغيير تاريخ وصوله لا ينقله', () => {
   const st = fresh();
-  ok(A.setIncome(st, '2026-11', 'rent', { received: true, receivedDate: '2026-12-02' }));
+  ok(A.setIncome(st, '2026-11', 'rent', { received: true, receivedDate: '2026-12-02' }, at('2026-12-02')));
   const s = sim(st, { until: '2027-03' });
   const sal = KD('1729.650'); const rent = KD(150);
   const fc = s.months.filter((m) => m.forecast && m.key <= '2027-03');
@@ -259,7 +261,7 @@ test('[13] احتياطي الجامعة يُحجز في يناير ويُصرف
   assert.equal(uni.potCover, KD(450), 'الجامعة مموَّلة من الاحتياطي');
   assert.equal(feb.cashEnd, KD(150), 'فبراير لا يدفع الجامعة من سيولته مرة ثانية');
   // دفع الجامعة فعليًا يُغطى من الاحتياطي ولا يخرج من السيولة مرتين
-  ok(A.holdReserve(st, 'res_uni', '2027-01-23'));
+  ok(A.holdReserve(st, 'res_uni', '2027-01-23', at('2027-01-23')));
   pay(st, 'uni', '2027-02', 450, '2027-02-05');
   const s2 = sim(st, { until: '2027-02' });
   assert.equal(s2.byKey['2027-01'].cashEnd, 0);
@@ -285,8 +287,8 @@ test('[14] دفعة نوفمبر المنفذة في 2 ديسمبر تُنسب �
 /* ───────── [15][16] الفيزا ───────── */
 test('[15] الفيزا: شراء يوم 15 على كشف نوفمبر ويوم 16 على كشف ديسمبر', () => {
   const st = fresh();
-  ok(A.addVisaPurchase(st, { date: '2026-11-15', amount: KD(400) }));
-  ok(A.addVisaPurchase(st, { date: '2026-11-16', amount: KD(120) }));
+  ok(A.addVisaPurchase(st, { date: '2026-11-15', amount: KD(400) }, '2026-11-15'));
+  ok(A.addVisaPurchase(st, { date: '2026-11-16', amount: KD(120) }, '2026-11-16'));
   assert.equal(E.visaCycleEnd('2026-11-15'), '2026-11-15');
   assert.equal(E.visaCycleEnd('2026-11-16'), '2026-12-15');
   ok(A.confirmStatement(st, '2026-11-15', '2026-11-15'));
@@ -298,15 +300,15 @@ test('[15] الفيزا: شراء يوم 15 على كشف نوفمبر ويوم 
   ok(A.confirmStatement(st, '2026-12-15', '2026-12-15'));
   assert.equal(st.visa.statements.find((s) => s.cycleEnd === '2026-11-15').amount, KD(400), 'كشف نوفمبر لم يتغير');
   // لا تجاوز للحد الائتماني
-  assert.notEqual(A.addVisaPurchase(st, { date: '2026-12-20', amount: KD(481) }), null);
-  ok(A.addVisaPurchase(st, { date: '2026-12-20', amount: KD(480) }));
+  assert.notEqual(A.addVisaPurchase(st, { date: '2026-12-20', amount: KD(481) }, '2026-12-20'), null);
+  ok(A.addVisaPurchase(st, { date: '2026-12-20', amount: KD(480) }, '2026-12-20'));
   assert.equal(E.visaSummary(st, '2026-12-20').available, 0);
 });
 test('[16] الفيزا: سداد جزئي ثم كامل، يُوزَّع على الأقدم، يحفظ السجل، ويُخصم من السيولة مرة واحدة', () => {
   const st = fresh();
-  A.addVisaPurchase(st, { date: '2026-11-10', amount: KD(400) });
+  A.addVisaPurchase(st, { date: '2026-11-10', amount: KD(400) }, '2026-11-10');
   A.confirmStatement(st, '2026-11-15', '2026-11-15');
-  A.addVisaPurchase(st, { date: '2026-11-20', amount: KD(120) });
+  A.addVisaPurchase(st, { date: '2026-11-20', amount: KD(120) }, '2026-11-20');
   A.confirmStatement(st, '2026-12-15', '2026-12-15');
   const before = sim(st, { until: '2027-01' });
   ok(A.addVisaPayment(st, { date: '2026-12-02', amount: KD(450) }, '2026-12-02'));
@@ -381,7 +383,7 @@ test('[19] التعثر يمدد الخطة ويظهر العجز المالي،
 test('[20] السداد الإضافي المؤكد يقلّص الخطة', () => {
   const st = fresh();
   const end0 = sim(st).endMonth;
-  ok(A.addExtra(st, { month: '2026-11', name: 'مبلغ مستلم', amount: KD(3000), status: 'received', date: '2026-11-03' }));
+  ok(A.addExtra(st, { month: '2026-11', name: 'مبلغ مستلم', amount: KD(3000), status: 'received', date: '2026-11-03' }, at('2026-11-03')));
   pay(st, 'furniture', '2026-11', 3000, '2026-11-04');
   const end1 = sim(st).endMonth;
   assert.ok(end1 < end0, `${end1} < ${end0}`);
@@ -399,7 +401,7 @@ test('[21] ترحيل بيانات الإصدارين 1 و2 دون فقدان أ
   E.itemById(v1, 'shuoon').extra = 'allow';
   pay(v1, 'furniture', '2026-09', 460, '2026-09-25');
   pay(v1, 'violations', '2026-11', 160, '2026-11-25');
-  A.addVisaPurchase(v1, { date: '2026-11-10', amount: KD(400) });
+  A.addVisaPurchase(v1, { date: '2026-11-10', amount: KD(400) }, '2026-11-10');
   for (const p of v1.payments) delete p.confirmed;
   v1.months['2026-10'].closeDate = '2026-12-01';
   const raw = JSON.parse(JSON.stringify(v1));
@@ -425,11 +427,11 @@ test('[21] ترحيل بيانات الإصدارين 1 و2 دون فقدان أ
 /* ───────── [24] منع الرصيد السالب والدفع الزائد ───────── */
 test('[24] منع الرصيد السالب والدفع الزائد غير المبرر', () => {
   const st = fresh();
-  assert.match(A.addPayment(st, { itemId: 'p_shafiq', month: '2026-11', amount: KD(25), date: '2026-11-05' }, { today: TODAY }) || '', /يتجاوز الرصيد/);
+  assert.match(A.addPayment(st, { itemId: 'p_shafiq', month: '2026-11', amount: KD(25), date: '2026-11-05' }, { today: at('2026-11-05') }) || '', /يتجاوز الرصيد/);
   pay(st, 'p_shafiq', '2026-11', 20, '2026-11-05', { confirmed: false });
-  assert.match(A.addPayment(st, { itemId: 'p_shafiq', month: '2026-11', amount: KD(5), date: '2026-11-05' }, { today: TODAY }) || '', /يتجاوز الرصيد/, 'الدفعة المعلقة تُحتسب في المنع');
-  assert.match(A.addPayment(st, { itemId: 'small', month: '2026-11', amount: KD(500), date: '2026-11-05' }, { today: TODAY }) || '', /لا يُسمح بسداد إضافي جزئي/);
-  assert.match(A.addPayment(st, { itemId: 'maid', month: '2026-11', amount: KD(200), date: '2026-11-05' }, { today: TODAY }) || '', /اكتب سبب الزيادة/);
+  assert.match(A.addPayment(st, { itemId: 'p_shafiq', month: '2026-11', amount: KD(5), date: '2026-11-05' }, { today: at('2026-11-05') }) || '', /يتجاوز الرصيد/, 'الدفعة المعلقة تُحتسب في المنع');
+  assert.match(A.addPayment(st, { itemId: 'small', month: '2026-11', amount: KD(500), date: '2026-11-05' }, { today: at('2026-11-05') }) || '', /لا يُسمح بسداد إضافي جزئي/);
+  assert.match(A.addPayment(st, { itemId: 'maid', month: '2026-11', amount: KD(200), date: '2026-11-05' }, { today: at('2026-11-05') }) || '', /اكتب سبب الزيادة/);
   pay(st, 'maid', '2026-11', 200, '2026-11-05', { note: 'إضافي متفق عليه' });
   assert.notEqual(A.addAdjustment(st, 'furniture', -1, 'x'), null);
   assert.notEqual(A.setCash(st, { amount: -1, date: '2026-11-01' }, TODAY), null);
@@ -456,7 +458,7 @@ test('[25] الدخل المتوقع والافتراضي ليس دخلًا مس
   for (const amt of [350, 500]) E.runScenario(st, { type: 'monthly', amount: KD(amt), start: '2026-12' }, TODAY);
   assert.equal(JSON.stringify(st), before);
   // المستلم فعليًا قد يختلف عن المخطط
-  ok(A.setIncome(st, '2026-11', 'salary', { received: true, receivedAmount: KD(1700), receivedDate: '2026-11-22' }));
+  ok(A.setIncome(st, '2026-11', 'salary', { received: true, receivedAmount: KD(1700), receivedDate: '2026-11-22' }, at('2026-11-22')));
   const s2 = sim(st);
   assert.equal(s2.byKey['2026-11'].income.received, KD(1700));
   assert.equal(s2.byKey['2026-11'].income.planned, KD('1729.650') + KD(150), 'المخطط محفوظ للمقارنة');
@@ -485,14 +487,14 @@ test('الدفعة المسجلة غير المؤكدة لا تُخصم حتى �
   pay(st, 'furniture', '2026-11', 460, '2026-11-25', { confirmed: false });
   assert.equal(E.debtStatus(st, E.itemById(st, 'furniture')).remaining, KD(5510));
   assert.equal(line(st, '2026-11', 'furniture').status, 'recorded');
-  ok(A.confirmPayment(st, st.payments[0].id));
+  ok(A.confirmPayment(st, st.payments[0].id, undefined, '2026-11-25'));
   assert.equal(line(st, '2026-11', 'furniture').status, 'done');
   assert.equal(E.debtStatus(st, E.itemById(st, 'furniture')).remaining, KD(5050));
 });
 
 test('الرصيد النقدي: التدفقات المؤكدة قبل تاريخ الرصيد لا تُحتسب مرتين', () => {
   const st = fresh();
-  ok(A.setIncome(st, '2026-11', 'salary', { received: true, receivedDate: '2026-11-22' }));
+  ok(A.setIncome(st, '2026-11', 'salary', { received: true, receivedDate: '2026-11-22' }, at('2026-11-22')));
   pay(st, 'furniture', '2026-11', 460, '2026-11-23');
   // الرصيد بعد الراتب والدفعة
   ok(A.setCash(st, { amount: KD('1269.650'), date: '2026-11-24' }, '2026-11-24'));

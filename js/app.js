@@ -49,6 +49,12 @@ function toast(msg, err = false) {
   setTimeout(() => t.remove(), err ? 3600 : 1900);
 }
 
+/** تسجيل دفعة مع تنبيه عند وجود دفعة مطابقة تمامًا (منع التكرار غير المقصود) */
+function addPay(data, msg) {
+  const dup = A.findDuplicatePayment(state, data);
+  if (dup && !confirm(`توجد دفعة مطابقة مسجلة مسبقًا (${fmtKD(dup.amount)} د.ك بتاريخ ${E.dateLabel(dup.date)}). تسجيلها مرة ثانية؟`)) return false;
+  return commit((s) => A.addPayment(s, data, { today }), msg);
+}
 /** تنفيذ عملية + حفظ + إعادة رسم */
 function commit(fn, okMsg) {
   const err = fn(state);
@@ -148,6 +154,8 @@ function dashboardCard(d, rel) {
   if (!rel.cashEntered) warn.push('لم يُدخل الرصيد النقدي المتاح — يُفترض صفرًا ولا تُستخدم أي فوائض من أشهر سابقة.');
   else if (rel.cashStale) warn.push(`الرصيد النقدي مُدخل بتاريخ ${E.dateLabel(state.settings.cash.date)} — حدّثه لنتيجة أدق.`);
   if (rel.excludedPersons.length) warn.push(`ديون أشخاص بانتظار التحقق خارج الجدولة وموعد الإغلاق: ${rel.excludedPersons.map((x) => `${esc(x.name)} ${fmtKD(x.remaining)}`).join('، ')}.`);
+  if (rel.overdueIncome.length) warn.push(`دخل متوقع تجاوز موعده ولم يُؤكد: ${rel.overdueIncome.map((x) => `${x.kind === 'rent' ? 'بدل إيجار' : 'راتب'} ${E.monthLabel(x.ofMonth)} (${E.dateLabel(x.date)})`).join('، ')}. أكّد استلامه أو عدّل قيمته.`);
+  if (rel.timing.length) warn.push(`دخل يصل بعد بداية الشهر التالي فلا يُستعمل قبل وصوله: ${rel.timing.map((t) => `${t.kind === 'rent' ? 'بدل إيجار' : 'راتب'} ${E.monthLabel(t.ofMonth)} يصل ${E.dateLabel(t.date)} ويُحتسب في ${E.monthLabel(t.cashMonth)}`).join('، ')}.`);
   if (rel.gaps.length) warn.push(`السيولة المتوقعة لا تكفي الالتزامات في ${rel.gaps.slice(0, 3).map((g) => E.monthLabel(g.key)).join('، ')}${rel.gaps.length > 3 ? ` و${rel.gaps.length - 3} أشهر أخرى` : ''} — الخطة تمتد تبعًا لذلك.`);
   return `
   <section class="card" aria-label="لوحة الديون">
@@ -548,7 +556,7 @@ function cellSheet(month, id, focusPay = true) {
     on(sh, '[data-a="pay"]', () => {
       const amount = money(v(sh, 'amount'));
       const confirmed = sw(sh, 'confirmed');
-      if (commit((s) => A.addPayment(s, { itemId: id, month, amount, date: v(sh, 'date'), note: v(sh, 'note'), confirmed }, { today }), confirmed ? 'تم تأكيد الدفع' : 'سُجلت الدفعة بانتظار التأكيد')) closeSheet();
+      if (addPay({ itemId: id, month, amount, date: v(sh, 'date'), note: v(sh, 'note'), confirmed }, confirmed ? 'تم تأكيد الدفع' : 'سُجلت الدفعة بانتظار التأكيد')) closeSheet();
     });
     on(sh, '[data-a="del-pay"]', (e, el) => {
       if (!confirm('حذف هذه الدفعة؟ سيُعاد حساب الخطة.')) return;
@@ -634,7 +642,7 @@ function arrearsSheet(month, id) {
     <button class="btn" data-a="pay">تسجيل السداد</button>`, (sh) => {
     on(sh, '[data-a="pay"]', () => {
       const amount = money(v(sh, 'amount'));
-      if (commit((s) => A.addPayment(s, { itemId: id, month, kind: 'arrears', amount, date: v(sh, 'date') }, { today }), 'تم السداد من العجز')) closeSheet();
+      if (addPay({ itemId: id, month, kind: 'arrears', amount, date: v(sh, 'date') }, 'تم السداد من العجز')) closeSheet();
     });
     setTimeout(() => sh.querySelector('[name="amount"]')?.select(), 50);
   });
@@ -745,7 +753,7 @@ function debtSheet(id) {
     on(sh, '[data-a="fill-full"]', () => { sh.querySelector('[name="pamount"]').value = inputKD(st.remaining); });
     on(sh, '[data-a="pay"]', () => {
       const amount = money(v(sh, 'pamount'));
-      if (commit((s) => A.addPayment(s, { itemId: id, month: v(sh, 'pmonth'), amount, date: v(sh, 'pdate') }, { today }), 'تم تسجيل السداد')) debtSheet(id);
+      if (addPay({ itemId: id, month: v(sh, 'pmonth'), amount, date: v(sh, 'pdate') }, 'تم تسجيل السداد')) debtSheet(id);
     });
     on(sh, '[data-a="close"]', () => { if (commit((s) => A.confirmClose(s, id, true), 'تم تأكيد الإغلاق')) closeSheet(); });
     on(sh, '[data-a="reopen"]', () => { if (commit((s) => A.confirmClose(s, id, false))) debtSheet(id); });
@@ -847,7 +855,7 @@ function quickPaySheet() {
     sh.querySelector('[name="item"]').addEventListener('change', fill); fill();
     on(sh, '[data-a="pay"]', () => {
       const amount = money(v(sh, 'amount'));
-      if (commit((s) => A.addPayment(s, { itemId: v(sh, 'item'), month, amount, date: v(sh, 'date') }, { today }), 'تم تأكيد الدفع')) closeSheet();
+      if (addPay({ itemId: v(sh, 'item'), month, amount, date: v(sh, 'date') }, 'تم تأكيد الدفع')) closeSheet();
     });
   });
 }
@@ -1009,6 +1017,8 @@ function visaPaySheet() {
     on(sh, '[data-fill]', (e, el) => { sh.querySelector('[name="amount"]').value = inputKD(Number(el.dataset.fill)); });
     on(sh, '[data-a="pay"]', () => {
       const amount = money(v(sh, 'amount'));
+      const dupV = A.findDuplicateVisaPayment(state, { amount, date: v(sh, 'date') });
+      if (dupV && !confirm(`يوجد سداد فيزا مطابق (${fmtKD(dupV.amount)} د.ك بتاريخ ${E.dateLabel(dupV.date)}). تسجيله مرة ثانية؟`)) return;
       if (commit((s) => A.addVisaPayment(s, { amount, date: v(sh, 'date'), cashMonth: v(sh, 'cm') || null }, today), 'تم تسجيل السداد')) closeSheet();
     });
   });
@@ -1073,7 +1083,7 @@ document.addEventListener('click', (e) => {
     case 'arrears-inline': {
       const inp = document.querySelector(`[data-arr-in="${d.id}"]`);
       const amount = money(inp?.value || '');
-      commit((s) => A.addPayment(s, { itemId: d.id, month: d.m, kind: 'arrears', amount, date: today }, { today }), 'تم السداد من العجز');
+      addPay({ itemId: d.id, month: d.m, kind: 'arrears', amount, date: today }, 'تم السداد من العجز');
       break;
     }
     case 'month-close': monthCloseSheet(view.month); break;
@@ -1140,7 +1150,12 @@ document.addEventListener('visibilitychange', () => {
 
 /* ───────────── التشغيل ───────────── */
 async function boot() {
-  let s = await loadState();
+  const loaded = await loadState();
+  let s = loaded.state;
+  if (!s && loaded.unreadable) {
+    $('#app').innerHTML = '<header class="top"><h1>خطتي المالية</h1></header><div class="alert">تعذرت قراءة البيانات المحفوظة على هذا الجهاز. لم يُنشأ أي شيء فوقها، وحُفظت نسخة من النص التالف. أعد فتح التطبيق.</div>';
+    return;
+  }
   if (!s || !s.schema) {
     s = E.createSeedState();
     await saveState(s);
@@ -1162,4 +1177,4 @@ async function boot() {
 boot();
 
 // للاختبارات
-window.__mfp = { get state() { return state; }, E, A };
+window.__mfp = { get state() { return state; }, E, A, fmtKD, get today() { return today; } };

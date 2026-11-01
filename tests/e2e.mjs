@@ -99,8 +99,71 @@ await p.waitForSelector('.grid');
 await ctx.setOffline(false);
 step('[22] يفتح دون إنترنت بعد أول تحميل');
 
+// الأرقام المعروضة = نتائج المحرك (لكل الأشهر الظاهرة)
+const mismatch = await p.evaluate(async () => {
+  const { E, fmtKD, today } = window.__mfp;
+  const st = window.__mfp.state;
+  const out = [];
+  const sim = E.simulate(st, { today, until: '2027-03' });
+  const dash = E.dashboard(st, sim);
+  const txt = document.querySelector('[aria-label="لوحة الديون"] .big .val').textContent.trim();
+  if (txt !== fmtKD(dash.remaining)) out.push(`dashboard ${txt} != ${fmtKD(dash.remaining)}`);
+  for (const m of ['2026-09', '2026-11', '2026-12', '2027-01', '2027-02']) {
+    localStorage.setItem('mfp-view-month', m);
+    document.querySelector(`[data-act="month"][data-m="${m}"]`)?.click();
+    if (!document.querySelector(`[data-act="month"][data-m="${m}"].sel`)) continue;
+    for (const l of sim.byKey[m].lines.filter((x) => x.planned > 0 || x.paidReg > 0)) {
+      const row = document.querySelector(`.li [data-act="cell-detail"][data-id="${l.id}"].amt`);
+      if (!row) { out.push(`${m} ${l.id} row missing`); continue; }
+      const a = row.querySelector('.a').textContent.trim();
+      if (a !== fmtKD(l.planned)) out.push(`${m} ${l.id} planned ${a} != ${fmtKD(l.planned)}`);
+      if (!row.querySelector('.b').textContent.includes(fmtKD(l.paidReg))) out.push(`${m} ${l.id} paid`);
+    }
+    const arr = document.querySelector('[aria-label="العجز"]');
+    for (const l of sim.byKey[m].lines.filter((x) => x.arrStartC - x.paidArr > 0)) {
+      if (!arr || !arr.textContent.includes(fmtKD(l.arrStartC - l.paidArr))) out.push(`${m} arrears ${l.id}`);
+    }
+    const liq = document.querySelector('[aria-label="السيولة"] .kv.total .v');
+    if (liq && sim.byKey[m].cashEnd !== null && liq.textContent.trim() !== fmtKD(sim.byKey[m].cashEnd)) out.push(`${m} cashEnd ${liq.textContent} != ${fmtKD(sim.byKey[m].cashEnd)}`);
+  }
+  return out;
+});
+assert.deepEqual(mismatch, []);
+step('الأرقام المعروضة مطابقة للمحرك حتى آخر فلس (لوحة، التزامات، عجز، سيولة)');
+
+// تكرار الدفعة يطلب تأكيدًا
+const dialogs = [];
+p.on('dialog', (d) => dialogs.push(d.message()));
+await p.evaluate(() => localStorage.setItem('mfp-view-month', '2026-11')); await p.reload(); await p.waitForSelector('.grid');
+for (let i = 0; i < 2; i++) {
+  await p.click('.li .chk[data-id="maid"]');
+  await p.fill('.sheet [name="amount"]', '10');
+  await p.fill('.sheet [name="date"]', await p.evaluate(() => window.__mfp.today));
+  await p.click('.sheet [data-a="pay"]');
+}
+assert.ok(dialogs.some((m) => m.includes('مطابقة')), 'لا تنبيه تكرار');
+step('إدخال دفعتين متطابقتين يظهر تنبيه التكرار');
+
+// انقطاع أثناء الحفظ: إعادة تحميل فورية بعد العملية
+const nBefore = await p.evaluate(() => window.__mfp.state.payments.length);
+await p.click('.li .chk[data-id="bills"]');
+await p.fill('.sheet [name="amount"]', '5');
+await p.fill('.sheet [name="date"]', await p.evaluate(() => window.__mfp.today));
+await Promise.all([p.click('.sheet [data-a="pay"]'), p.waitForTimeout(0)]);
+await p.reload(); await p.waitForSelector('.grid');
+assert.equal(await p.evaluate(() => window.__mfp.state.payments.length), nBefore + 1);
+step('إعادة تحميل فورية بعد الحفظ لا تفقد العملية');
+
+// بيانات تالفة: لا يُنشأ شيء فوقها
+const keep = await p.evaluate(() => window.__mfp.state.payments.length);
+await p.evaluate(() => localStorage.setItem('mfp-state-v1', '{"items":[tr'));
+await p.reload(); await p.waitForSelector('.grid');
+assert.equal(await p.evaluate(() => window.__mfp.state.payments.length), keep, 'استُخدمت نسخة IndexedDB السليمة');
+assert.ok(await p.evaluate(() => Object.keys(localStorage).some((k) => k.startsWith('mfp-state-v1-unreadable-'))), 'نسخة من البيانات التالفة محفوظة');
+step('نسخة localStorage تالفة: يُحمّل من IndexedDB وتُحفظ نسخة من التالف');
+
 // [23] سلامة العرض على iPhone: لا تمرير أفقي، وكل الأوراق تفتح دون أخطاء
-for (const w of [375, 390, 430]) {
+for (const w of [320, 375, 390, 414, 430]) {
   await p.setViewportSize({ width: w, height: 844 });
   for (const m of ['2026-09', '2026-11', '2027-02']) {
     await p.click(`[data-act="month"][data-m="${m}"]`).catch(async () => { await p.evaluate((mm) => localStorage.setItem('mfp-view-month', mm), m); await p.reload(); await p.waitForSelector('.grid'); });
@@ -109,7 +172,7 @@ for (const w of [375, 390, 430]) {
   }
 }
 await p.setViewportSize({ width: 390, height: 844 });
-for (const sel of ['[data-act="settings"]', '[data-act="add"]', '[data-act="month-close"]', '[data-act="cash"]', '[data-act="income"][data-kind="salary"]', '.li [data-act="item"][data-id="p_abuosama"]', '[data-act="visa-buy"]', '[data-act="visa-pay"]', '[data-act="visa-history"]', '[data-act="log"]']) {
+for (const sel of ['[data-act="settings"]', '[data-act="add"]', '[data-act="month-close"]', '[data-act="cash"]', '[data-act="income"][data-kind="salary"]', '[data-act="income"][data-kind="rent"]', '.li [data-act="item"][data-id="p_abuosama"]', '.g-name[data-act="item"][data-id="furniture"]', '.li .chk[data-id="violations"]', '[data-act="extra-new"]', '[data-act="quick-pay"]', '[data-act="visa-buy"]', '[data-act="visa-pay"]', '[data-act="visa-history"]', '[data-act="log"]']) {
   await p.evaluate(() => localStorage.setItem('mfp-view-month', '2026-11'));
   const el = await p.$(sel);
   if (!el) { await p.reload(); await p.waitForSelector('.grid'); }
@@ -119,7 +182,7 @@ for (const sel of ['[data-act="settings"]', '[data-act="add"]', '[data-act="mont
   assert.ok(over <= 0, `ورقة ${sel} أعرض من الشاشة`);
   await p.click('.sheet [data-close]');
 }
-step('[23] العرض على عرض iPhone (375/390/430) بلا تمرير أفقي، وكل الأوراق تعمل');
+step('[23] العرض على عروض iPhone (320/375/390/414/430) بلا تمرير أفقي، وكل الأوراق تعمل');
 
 assert.deepEqual(errors, []);
 await b.close();
