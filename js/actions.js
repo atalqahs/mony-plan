@@ -1,7 +1,7 @@
 // عمليات تعديل الحالة مع التحقق. كل دالة ترجع null عند النجاح أو رسالة خطأ.
 import {
   simulate, uid, itemById, debtStatus, visaSummary, kuwaitToday, monthLabel, dateLabel,
-  visaCycleEnd, monthOfDate, DEFAULT_PRIORITY,
+  visaCycleEnd, monthOfDate, DEFAULT_PRIORITY, forecastStartOf,
 } from './engine.js';
 import { fmtKD } from './money.js';
 
@@ -18,14 +18,29 @@ const FUTURE = 'تاريخ عملية مؤكدة لا يمكن أن يكون ف�
  * تسجيل دفعة. month = الشهر المالي المنسوبة إليه الدفعة، date = تاريخ التنفيذ الفعلي (مستقلان).
  * confirmed=false: دفعة مسجلة لم يتأكد سدادها بعد — لا تدخل في الأرصدة أو العجز حتى تأكيدها.
  */
-export function addPayment(state, { itemId, month, kind = 'regular', amount, date, note = '', confirmed = true }, opts = {}) {
+export const DUPLICATE = 'DUPLICATE';
+export const ALREADY_SAVED = 'تم حفظ هذه العملية مسبقًا — لم تُسجل مرة ثانية';
+/**
+ * date=null مسموح فقط لدفعة تاريخية مؤكدة (شهرها قبل الشهر الحالي) مع dateUnknown=true:
+ * تُسجل دون اختراع تاريخ تنفيذ، ولا أثر نقدي لها (مُضمَّنة في الماضي).
+ * opId: معرّف العملية من نافذة الإدخال — يمنع الحفظ المزدوج بالضغط المتكرر.
+ * allowDuplicate: لا تُقبل دفعة مطابقة تمامًا لدفعة موجودة إلا إذا أكد المستخدم أنها عملية مستقلة.
+ */
+export function addPayment(state, { itemId, month, kind = 'regular', amount, date, note = '', confirmed = true, dateUnknown = false, opId = null, allowDuplicate = false }, opts = {}) {
   const item = itemById(state, itemId);
   if (!item) return 'البند غير موجود';
   if (!okMonth(month)) return 'الشهر غير صالح';
   if (!okAmount(amount)) return 'أدخل مبلغًا أكبر من صفر';
-  if (!okDate(date)) return 'التاريخ غير صالح';
+  const today = opts.today || kuwaitToday();
+  if (dateUnknown) {
+    if (!confirmed) return 'الدفعة غير المؤكدة تحتاج تاريخًا';
+    if (month >= forecastStartOf(state, today)) return 'التاريخ غير المعروف مسموح للدفعات التاريخية فقط';
+    date = null;
+  } else if (!okDate(date)) return 'التاريخ غير صالح';
   if (kind !== 'regular' && kind !== 'arrears') return 'نوع الدفعة غير صالح';
-  if (confirmed && date > (opts.today || kuwaitToday())) return FUTURE;
+  if (confirmed && date && date > today) return FUTURE;
+  if (opId && state.payments.some((p) => p.opId === opId)) return ALREADY_SAVED;
+  if (!allowDuplicate && state.payments.some((p) => p.itemId === itemId && p.month === month && p.kind === kind && p.amount === amount && (p.date || null) === (date || null))) return DUPLICATE;
   if (item.type === 'debt') {
     const st = debtStatus(state, item);
     const free = st.remaining - st.pending; // نحتسب الدفعات المسجلة غير المؤكدة لمنع تجاوز الرصيد
@@ -53,8 +68,11 @@ export function addPayment(state, { itemId, month, kind = 'regular', amount, dat
     if (amount > rem) return `المبلغ أكبر من العجز المتبقي (${fmtKD(rem)} د.ك)`;
   }
   const p = { id: uid('pay'), itemId, month, kind, amount, date, note, confirmed: !!confirmed, createdAt: nowIso() };
+  if (opId) p.opId = opId;
+  if (date === null) p.dateUnknown = true;
+  if (allowDuplicate) p.duplicateConfirmed = true;
   state.payments.push(p);
-  log(state, `${kind === 'arrears' ? 'سداد من العجز' : 'دفعة'}${confirmed ? '' : ' (مسجلة — بانتظار التأكيد)'} — ${item.name} — خطة ${monthLabel(month)}: ${fmtKD(amount)} د.ك بتاريخ ${dateLabel(date)}`);
+  log(state, `${kind === 'arrears' ? 'سداد من العجز' : 'دفعة'}${confirmed ? '' : ' (مسجلة — بانتظار التأكيد)'} — ${item.name} — خطة ${monthLabel(month)}: ${fmtKD(amount)} د.ك ${date ? `بتاريخ ${dateLabel(date)}` : '(تاريخ التنفيذ غير معروف)'}`);
   return null;
 }
 
@@ -64,12 +82,15 @@ export function updatePayment(state, id, patch, opts = {}) {
   const before = { ...p };
   const idx = state.payments.indexOf(p);
   state.payments.splice(idx, 1);
-  const next = { ...before, ...patch };
+  const next = { ...before, ...patch, opId: null, allowDuplicate: true, dateUnknown: (patch.date === undefined ? before.date === null : !patch.date) };
+  if (!next.dateUnknown && !next.date) return 'التاريخ غير صالح';
   const err = addPayment(state, next, opts);
   if (err) { state.payments.splice(idx, 0, before); return err; }
   // أعِد المعرّف الأصلي ووقت الإنشاء للحفاظ على التاريخ
   const added = state.payments[state.payments.length - 1];
   added.id = before.id; added.createdAt = before.createdAt; added.editedAt = nowIso();
+  if (before.opId) added.opId = before.opId;
+  if (!before.duplicateConfirmed) delete added.duplicateConfirmed;
   state.log.pop();
   const item = itemById(state, p.itemId);
   log(state, `تعديل دفعة — ${item?.name}: ${fmtKD(before.amount)} ← ${fmtKD(added.amount)} د.ك (${monthLabel(added.month)})`);
@@ -233,6 +254,7 @@ export function updateItem(state, id, patch) {
   if (patch.name !== undefined && !patch.name.trim()) return 'أدخل الاسم';
   if (patch.opening !== undefined && !okAmount(patch.opening)) return 'الرصيد غير صالح';
   if (patch.mandatory !== undefined && (!Number.isSafeInteger(patch.mandatory) || patch.mandatory < 0)) return 'القسط غير صالح';
+  if (patch.dueDay !== undefined && patch.dueDay !== null && (!Number.isInteger(patch.dueDay) || patch.dueDay < 1 || patch.dueDay > 31)) return 'يوم الاستحقاق بين 1 و31';
   if (patch.opening !== undefined && it.type === 'debt') {
     const paid = state.payments.filter((p) => p.itemId === id).reduce((a, p) => a + p.amount, 0);
     const adj = state.adjustments.filter((a) => a.itemId === id).reduce((a, x) => a + x.delta, 0);
@@ -298,13 +320,15 @@ export function confirmClose(state, itemId, value = true) {
 
 /* ── الفيزا ── */
 
-export function addVisaPurchase(state, { date, amount, note = '' }, today = kuwaitToday()) {
+export function addVisaPurchase(state, { date, amount, note = '', opId = null, allowDuplicate = false }, today = kuwaitToday()) {
   if (!okDate(date)) return 'التاريخ غير صالح';
+  if (opId && state.visa.purchases.some((p) => p.opId === opId)) return ALREADY_SAVED;
+  if (!allowDuplicate && state.visa.purchases.some((p) => p.amount === amount && p.date === date && (p.note || '') === (note || ''))) return DUPLICATE;
   if (date > today) return FUTURE;
   if (!okAmount(amount)) return 'أدخل مبلغًا أكبر من صفر';
   const vs = visaSummary(state);
   if (amount > vs.available) return `المبلغ يتجاوز الحد المتاح (${fmtKD(Math.max(0, vs.available))} د.ك)`;
-  const p = { id: uid('vp'), date, amount, note, createdAt: nowIso() };
+  const p = { id: uid('vp'), date, amount, note, createdAt: nowIso(), ...(opId ? { opId } : {}) };
   state.visa.purchases.push(p);
   log(state, `فيزا — شراء ${fmtKD(amount)} د.ك بتاريخ ${dateLabel(date)} (كشف ${dateLabel(visaCycleEnd(date, state.settings.visaStatementDay))})${note ? ` — ${note}` : ''}`);
   return null;
@@ -331,15 +355,17 @@ export function deleteVisaPurchase(state, id) {
   log(state, `فيزا — حذف شراء ${fmtKD(p.amount)} د.ك (${dateLabel(p.date)})`);
   return null;
 }
-export function addVisaPayment(state, { date, amount, note = '', cashMonth }, today = kuwaitToday()) {
+export function addVisaPayment(state, { date, amount, note = '', cashMonth, opId = null, allowDuplicate = false }, today = kuwaitToday()) {
   if (!okDate(date)) return 'التاريخ غير صالح';
+  if (opId && state.visa.payments.some((p) => p.opId === opId)) return ALREADY_SAVED;
+  if (!allowDuplicate && state.visa.payments.some((p) => p.amount === amount && p.date === date)) return DUPLICATE;
   if (date > today) return FUTURE;
   if (!okAmount(amount)) return 'أدخل مبلغًا أكبر من صفر';
   const vs = visaSummary(state, today);
   if (amount > vs.used) return `المبلغ أكبر من المستخدم غير المسدد (${fmtKD(vs.used)} د.ك)`;
   // يُخصم من سيولة شهر واحد فقط (أو لا يُخصم) — لا خصم مزدوج
   const cm = cashMonth === undefined ? monthOfDate(date) : cashMonth;
-  state.visa.payments.push({ id: uid('vy'), date, amount, note, cashMonth: cm || null, createdAt: nowIso() });
+  state.visa.payments.push({ id: uid('vy'), date, amount, note, cashMonth: cm || null, createdAt: nowIso(), ...(opId ? { opId } : {}) });
   log(state, `فيزا — سداد ${fmtKD(amount)} د.ك بتاريخ ${dateLabel(date)}${cm ? ` (من سيولة ${monthLabel(cm)})` : ''}`);
   return null;
 }

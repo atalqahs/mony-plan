@@ -14,12 +14,17 @@ const at = (d) => (d > T ? d : T);
 
 function mode1(verifyAbu) {
   const st = E.createSeedState('2026-11-01T00:00:00.000Z');
+  // سبتمبر/أكتوبر مدفوعة بالكامل ومغلقة؛ تُسجل الدفعات التاريخية دون اختراع تاريخ تنفيذ (dateUnknown)
+  const hist = (id, m, fils) => ok(A.addPayment(st, { itemId: id, month: m, amount: fils, dateUnknown: true }, { today: T }));
   for (const [m, vals] of Object.entries({ '2026-09': { furniture: 460, violations: 537.8, small: 170 }, '2026-10': { furniture: 460, violations: 164, small: 170, shuoon: 137.5 } })) {
-    for (const [id, v] of Object.entries(vals)) ok(A.addPayment(st, { itemId: id, month: m, amount: KD(v), date: `${m}-25` }, { today: at(`${m}-25`) }));
-    for (const id of ['maid', 'bills', 'personal']) ok(A.addPayment(st, { itemId: id, month: m, amount: E.expenseAmountFor(E.itemById(st, id), m), date: `${m}-25` }, { today: T }));
+    for (const [id, v] of Object.entries(vals)) hist(id, m, KD(v));
+    for (const id of ['maid', 'bills', 'personal']) hist(id, m, E.expenseAmountFor(E.itemById(st, id), m));
   }
-  for (const [id, a] of [['p_suhail', 550], ['p_shafiq', 24], ['p_electric', 20]]) ok(A.addPayment(st, { itemId: id, month: '2026-09', amount: KD(a), date: '2026-09-10' }, { today: T }));
-  if (verifyAbu) ok(A.setVerified(st, 'p_abuosama', true));
+  hist('p_suhail', '2026-09', KD(550));
+  hist('p_shafiq', '2026-09', KD(24));
+  hist('p_electric', '2026-09', KD(20));
+  for (const m of ['2026-09', '2026-10']) ok(A.closeMonth(st, m, true, T));
+  if (verifyAbu === false) ok(A.setVerified(st, 'p_abuosama', false));
   return st;
 }
 
@@ -29,7 +34,8 @@ function table(st, title, opts = {}) {
   const diffs = compare(sim, ver);
   const debts = E.debtsOf(st).filter((d) => sim.months.some((m) => m.lines.some((l) => l.id === d.id)));
   const short = { furniture: 'أثاث', violations: 'مخالفات', small: 'صغير', shuoon: 'شؤون', p_suhail: 'سهيل', p_shafiq: 'شفيق', p_electric: 'كهربائي', p_abuosama: 'أبو أسامة' };
-  let md = `## ${title}\n\nموعد الإغلاق: **${sim.endMonth ? E.monthLabel(sim.endMonth) : 'غير قابل للتحديد'}** — المحرك المستقل: **${ver.endMonth ? E.monthLabel(ver.endMonth) : '—'}** — الفروق: **${diffs.length}**\n\n`;
+  const excl = sim.excludedPersons.map((x) => `${x.name} ${f(x.remaining)}`).join('، ');
+  let md = `## ${title}\n\n- إغلاق الديون الداخلة في الجدولة: **${sim.endMonth ? E.monthLabel(sim.endMonth) : 'غير قابل للتحديد'}** (المحرك المستقل: ${ver.endMonth ? E.monthLabel(ver.endMonth) : '—'})\n- إغلاق جميع الديون المعروفة: **${sim.allDebtsEndMonth ? E.monthLabel(sim.allDebtsEndMonth) : `غير محدد — ديون مستثناة: ${excl}`}**\n- الفروق بين المحركين: **${diffs.length}**\n\n`;
   md += '| الشهر | النوع | الدخل المتوقع للنافذة | المستلم المؤكد | المصاريف الأساسية | التزامات غير الديون (جامعة/احتياطي) | الأقساط الإلزامية | الدفعات الإضافية | العجز المرحّل | النقد بداية → نهاية | عجز مالي |\n|---|---|---|---|---|---|---|---|---|---|---|\n';
   for (const m of sim.months) {
     const ess = m.lines.filter((l) => l.type === 'expense' && ['maid', 'bills', 'personal'].includes(l.id)).reduce((a, l) => a + l.regUsed, 0);
@@ -60,8 +66,8 @@ function table(st, title, opts = {}) {
 }
 
 const parts = [];
-const r1 = table(mode1(false), 'الوضع 1 — سبتمبر/أكتوبر مؤكدة، الأشخاص الثلاثة مسجلون، أبو أسامة بانتظار التحقق');
-const r1b = table(mode1(true), 'الوضع 1ب — كما سبق مع تأكيد استحقاق أبو أسامة (450)');
+const r1 = table(mode1(true), 'السيناريو الأساسي — سبتمبر/أكتوبر مدفوعة ومغلقة (تواريخ التنفيذ غير معروفة)، الأشخاص الثلاثة مسجلون، أبو أسامة دين قائم 450');
+const r1b = table(mode1(false), 'مقارنة — لو كان أبو أسامة بانتظار التحقق (خارج الجدولة)');
 const r2 = table(E.createSeedState('2026-11-01T00:00:00.000Z'), 'الوضع 2 — بيانات تاريخية غير مكتملة (لا شيء مسجل)');
 const st3 = mode1(true); ok(A.closeMonth(st3, '2026-11', true, '2026-12-05'));
 const r3 = (() => { const sim = E.simulate(st3, { today: '2026-12-05' }); const ver = verify(st3, { today: '2026-12-05' }); return { sim, ver, diffs: compare(sim, ver) }; })();
@@ -70,7 +76,7 @@ parts.push(`## الوضع 3 — تعثر نوفمبر كاملًا ثم استئ
 const header = `# جدول السداد الكامل ومطابقة المحركين\n\nمولَّد آليًا من \`tests/schedule-report.mjs\` بتاريخ افتراضي ${T}. كل المبالغ بالدينار (ثلاث منازل). الرصيد النقدي المُدخل = صفر. الدخل في الأشهر التوقعية متوقع وغير مستلم.\n\n`;
 mkdirSync(new URL('../docs/', import.meta.url), { recursive: true });
 writeFileSync(new URL('../docs/AUDIT-SCHEDULE.md', import.meta.url), header + parts.join('\n\n'));
-console.log('mode1', r1.sim.endMonth, r1.ver.endMonth, r1.diffs.length);
-console.log('mode1b', r1b.sim.endMonth, r1b.ver.endMonth, r1b.diffs.length);
+console.log('base', r1.sim.endMonth, r1.sim.allDebtsEndMonth, r1.ver.endMonth, r1.diffs.length);
+console.log('abu-unverified', r1b.sim.endMonth, r1b.sim.allDebtsEndMonth, r1b.ver.endMonth, r1b.diffs.length);
 console.log('mode2', r2.sim.endMonth, r2.ver.endMonth, r2.diffs.length);
 console.log('mode3', r3.sim.endMonth, r3.ver.endMonth, r3.diffs.length);

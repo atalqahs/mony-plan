@@ -1,12 +1,13 @@
 // يعمل دون إنترنت بعد أول تحميل. البيانات في IndexedDB ولا تتأثر بتحديث هذا الملف.
-const VERSION = 'mfp-v4';
+const VERSION = 'mfp-v5';
 const ASSETS = [
   './', './index.html', './css/app.css', './manifest.webmanifest',
   './js/app.js', './js/engine.js', './js/actions.js', './js/money.js', './js/store.js',
   './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png',
 ];
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+  // cache: 'reload' يتجاوز ذاكرة HTTP حتى لا تُخزَّن نسخة قديمة بعد التحديث
+  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(ASSETS.map((u) => new Request(u, { cache: 'reload' })))).then(() => self.skipWaiting()));
 });
 self.addEventListener('activate', (e) => {
   e.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== VERSION).map((k) => caches.delete(k)))).then(() => self.clients.claim()));

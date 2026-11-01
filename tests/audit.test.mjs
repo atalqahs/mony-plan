@@ -75,13 +75,16 @@ function audit(st, today = T, label = '') {
 /* ═════════ الأوضاع الثلاثة للسيناريو الأساسي ═════════ */
 function mode1() {
   const st = fresh();
+  // سبتمبر/أكتوبر مدفوعة بالكامل ومغلقة؛ تُسجل الدفعات التاريخية دون اختراع تاريخ تنفيذ (dateUnknown)
+  const hist = (id, m, fils) => ok(A.addPayment(st, { itemId: id, month: m, amount: fils, dateUnknown: true }, { today: T }));
   for (const [m, vals] of Object.entries({ '2026-09': { furniture: 460, violations: 537.8, small: 170 }, '2026-10': { furniture: 460, violations: 164, small: 170, shuoon: 137.5 } })) {
-    for (const [id, v] of Object.entries(vals)) pay(st, id, m, v, `${m}-25`);
-    for (const id of ['maid', 'bills', 'personal']) pay(st, id, m, E.expenseAmountFor(E.itemById(st, id), m) / 1000, `${m}-25`);
+    for (const [id, v] of Object.entries(vals)) hist(id, m, KD(v));
+    for (const id of ['maid', 'bills', 'personal']) hist(id, m, E.expenseAmountFor(E.itemById(st, id), m));
   }
-  pay(st, 'p_suhail', '2026-09', 550, '2026-09-10');
-  pay(st, 'p_shafiq', '2026-09', 24, '2026-09-10');
-  pay(st, 'p_electric', '2026-09', 20, '2026-09-10');
+  hist('p_suhail', '2026-09', KD(550));
+  hist('p_shafiq', '2026-09', KD(24));
+  hist('p_electric', '2026-09', KD(20));
+  for (const m of ['2026-09', '2026-10']) ok(A.closeMonth(st, m, true, T));
   return st;
 }
 
@@ -227,13 +230,17 @@ test('حالات خطرة: كل عملية تُتبع بتحقق كامل من �
   assert.ok(feb.fundingGap > 0 || feb.lines.some((l) => l.projArr < l.arrStart));
   assert.ok(sim.endMonth > '2027-05');
 
-  // دفعتان متطابقتان: يُكتشف التكرار، وإن أُكد يُحسب مرتين ضمن سقف الرصيد
+  // دفعتان متطابقتان: الثانية مرفوضة ما لم يؤكد المستخدم أنها عملية مستقلة؛ إعادة الضغط بنفس المعرّف مرفوضة دائمًا
   const st4 = fresh();
-  const dup = { itemId: 'furniture', month: '2026-11', amount: KD(460), date: '2026-11-05' };
+  const dup = { itemId: 'furniture', month: '2026-11', amount: KD(460), date: '2026-11-05', opId: 'op-1' };
   ok(A.addPayment(st4, dup, { today: T }));
-  assert.ok(A.findDuplicatePayment(st4, dup));
-  ok(A.addPayment(st4, dup, { today: T }));
+  assert.equal(A.addPayment(st4, dup, { today: T }), A.ALREADY_SAVED, 'ضغط مزدوج بنفس العملية');
+  assert.equal(A.addPayment(st4, { ...dup, opId: 'op-2' }, { today: T }), A.DUPLICATE, 'تطابق غير مقصود');
+  assert.equal(st4.payments.length, 1);
+  assert.equal(E.debtStatus(st4, E.itemById(st4, 'furniture')).remaining, KD(5050));
+  ok(A.addPayment(st4, { ...dup, opId: 'op-3', allowDuplicate: true }, { today: T }));
   assert.equal(E.debtStatus(st4, E.itemById(st4, 'furniture')).remaining, KD(5510) - KD(920));
+  assert.equal(st4.payments[1].duplicateConfirmed, true);
   audit(st4, T, 'dup-pay');
 
   // سداد فيزا مرتين / بلوغ الحد / تجاوز الحد
@@ -242,7 +249,9 @@ test('حالات خطرة: كل عملية تُتبع بتحقق كامل من �
   assert.notEqual(A.addVisaPurchase(st5, { date: '2026-11-02', amount: 1 }, T), null, 'تجاوز الحد مرفوض');
   ok(A.addVisaPayment(st5, { date: '2026-11-03', amount: KD(600) }, T));
   assert.ok(A.findDuplicateVisaPayment(st5, { date: '2026-11-03', amount: KD(600) }));
-  assert.notEqual(A.addVisaPayment(st5, { date: '2026-11-03', amount: KD(600) }, T), null, 'السداد الثاني يتجاوز المستخدم');
+  assert.equal(A.addVisaPayment(st5, { date: '2026-11-03', amount: KD(600) }, T), A.DUPLICATE, 'سداد فيزا مكرر مرفوض');
+  assert.notEqual(A.addVisaPayment(st5, { date: '2026-11-03', amount: KD(600), allowDuplicate: true }, T), null, 'وحتى مع التأكيد يتجاوز المستخدم');
+  assert.equal(st5.visa.payments.length, 1);
   ok(A.addVisaPayment(st5, { date: '2026-11-03', amount: KD(400) }, T));
   assert.equal(E.visaSummary(st5, T).available, KD(1000));
   audit(st5, T, 'visa');
@@ -356,4 +365,134 @@ test('تنبيهات التوقيت: دخل متأخر عن موعده أو يص
   rel = E.planReliability(st, E.simulate(st, { today: '2026-11-23' }), '2026-11-23');
   assert.ok(rel.timing.some((t) => t.kind === 'rent' && t.cashMonth === '2026-12'));
   audit(st, '2026-11-23', 'timing');
+});
+
+test('جدول السداد المرجعي: إجمالي الديون في نهاية كل شهر (نوفمبر 2026 – مايو 2027)', () => {
+  const st = mode1();
+  const sim = audit(st, T, 'reference');
+  const ver = verify(st, { today: T });
+  const ref = {
+    '2026-10': '9031.700', '2026-11': '7562.050', '2026-12': '6092.400', '2027-01': '5072.750',
+    '2027-02': '3753.100', '2027-03': '2133.450', '2027-04': '663.800', '2027-05': '0.000',
+  };
+  for (const [m, v] of Object.entries(ref)) {
+    const total = Object.values(sim.byKey[m].debtBalancesEnd).reduce((a, b) => a + Math.max(0, b), 0);
+    const vtotal = Object.values(ver.months.find((x) => x.key === m).balances).reduce((a, b) => a + Math.max(0, b), 0);
+    assert.equal(total, KD(v), `${m}: المحرك ${total} ≠ المرجع ${v}`);
+    assert.equal(vtotal, KD(v), `${m}: المستقل ${vtotal} ≠ المرجع ${v}`);
+  }
+  assert.equal(sim.endMonth, '2027-05');
+  assert.equal(sim.allDebtsEndMonth, '2027-05', 'كل الديون المعروفة (ومنها أبو أسامة) تُغلق في مايو');
+  // الدفعات التاريخية بلا تاريخ لا تُخترع لها تواريخ ولا أثر نقدي
+  assert.ok(st.payments.every((p) => p.date === null && p.dateUnknown === true));
+  assert.equal(sim.byKey['2026-11'].cashStart, 0);
+});
+
+test('الإغلاق الشامل: لا «خالص» ما دام دين معروف برصيد موجب', () => {
+  const st = mode1();
+  ok(A.setVerified(st, 'p_abuosama', false));
+  const sim = audit(st, T, 'abu-unverified');
+  assert.equal(sim.endMonth, '2027-05', 'الديون المجدولة تُغلق في مايو');
+  assert.equal(sim.allDebtsEndMonth, null, 'لكن ليس كل الديون المعروفة');
+  assert.deepEqual(sim.excludedPersons.map((x) => [x.id, x.remaining]), [['p_abuosama', KD(450)]]);
+});
+
+/* ═════════ التحقق اليومي من توفر النقد (تواريخ الأحداث) ═════════ */
+const setDue = (st, m, ids, date) => { for (const id of ids) ok(A.setDueDate(st, m, id, date)); };
+const NOV_ALL = ['furniture', 'violations', 'small', 'shuoon', 'maid', 'bills', 'personal'];
+
+test('يومي: بلا تواريخ استحقاق لا يُخترع موعد — النتيجة «غير محسوم»', () => {
+  const st = mode1();
+  const sim = E.simulate(st, { today: T });
+  const d = E.dailyLedger(st, sim, T);
+  assert.equal(d.status, 'unresolved');
+  assert.equal(d.shortfalls.length, 0);
+  assert.ok(d.undated.length > 20);
+  assert.ok(d.undated.some((u) => u.id === 'uni' && u.month === '2027-02'));
+});
+
+test('يومي: الراتب يوم 22 والأقساط يوم 25 — المال متوفر', () => {
+  const st = mode1();
+  setDue(st, '2026-11', NOV_ALL.filter((x) => x !== 'violations'), '2026-11-25');
+  setDue(st, '2026-11', ['violations'], '2026-12-02'); // جزء منها من بدل إيجار نوفمبر الواصل 1 ديسمبر
+  const d = E.dailyLedger(st, E.simulate(st, { today: T }), T);
+  assert.equal(d.shortfalls.filter((x) => x.month === '2026-11').length, 0);
+});
+
+test('يومي: عدة التزامات قبل وصول الراتب، أو تقديم موعد قسط — نقص بتاريخه', () => {
+  const st = mode1();
+  setDue(st, '2026-11', ['furniture', 'small'], '2026-11-10'); // قبل راتب 22 نوفمبر والرصيد صفر
+  let d = E.dailyLedger(st, E.simulate(st, { today: T }), T);
+  const s = d.shortfalls.filter((x) => x.date === '2026-11-10');
+  assert.ok(s.length >= 1);
+  assert.equal(s[s.length - 1].short, KD(630), '460 + 170 مستحقة قبل وصول المال');
+  // مع رصيد نقدي كافٍ مُدخل: لا نقص
+  ok(A.setCash(st, { amount: KD(700), date: '2026-11-05' }, T));
+  d = E.dailyLedger(st, E.simulate(st, { today: T }), T);
+  assert.equal(d.shortfalls.filter((x) => x.date === '2026-11-10').length, 0);
+});
+
+test('يومي: تأخر بدل الإيجار عن موعد قسط يعتمد عليه — نقص 150 بتاريخ القسط', () => {
+  const st = mode1();
+  setDue(st, '2026-11', NOV_ALL.filter((x) => x !== 'violations'), '2026-11-25');
+  setDue(st, '2026-11', ['violations'], '2026-12-05');
+  assert.equal(E.dailyLedger(st, E.simulate(st, { today: T }), T).shortfalls.filter((x) => x.month === '2026-11').length, 0);
+  ok(A.setIncome(st, '2026-11', 'rent', { date: '2026-12-10' }));
+  const d = E.dailyLedger(st, E.simulate(st, { today: T }), T);
+  const s = d.shortfalls.find((x) => x.id === 'violations' && x.month === '2026-11');
+  assert.ok(s, 'نقص بسبب تأخر بدل الإيجار');
+  assert.equal(s.date, '2026-12-05');
+  assert.equal(s.short, KD(150));
+});
+
+test('يومي: تأخر الراتب عن مواعيد الأقساط — نقص', () => {
+  const st = mode1();
+  setDue(st, '2026-11', NOV_ALL, '2026-11-25');
+  ok(A.setIncome(st, '2026-11', 'salary', { date: '2026-11-28' }));
+  const d = E.dailyLedger(st, E.simulate(st, { today: T }), T);
+  assert.ok(d.shortfalls.some((x) => x.date === '2026-11-25'));
+});
+
+test('يومي: احتياطي الجامعة — 300 من راتب يناير و150 من إيجار يناير، لا يُستعمل قبل اكتماله ولا مرتين', () => {
+  const st = mode1();
+  const r = st.reserves[0];
+  let f = E.reserveFunding(st, r);
+  assert.deepEqual(f.sources.map((x) => [x.kind, x.amount, x.date]), [['salary', KD(300), '2027-01-22'], ['rent', KD(150), '2027-02-01']]);
+  assert.equal(f.completeDate, '2027-02-01', 'يكتمل التمويل يوم وصول إيجار يناير');
+  assert.equal(f.sumOk, true);
+  // استحقاق الجامعة يوم 10 فبراير: بعد اكتمال التمويل
+  ok(A.setDueDate(st, '2027-02', 'uni', '2027-02-10'));
+  let d = E.dailyLedger(st, E.simulate(st, { today: T }), T);
+  assert.equal(d.shortfalls.filter((x) => x.id === 'uni').length, 0);
+  // تأخر إيجار يناير إلى 15 فبراير: الجامعة مستحقة قبل اكتمال التمويل
+  ok(A.setIncome(st, '2027-01', 'rent', { date: '2027-02-15' }));
+  f = E.reserveFunding(st, r);
+  assert.equal(f.dueBeforeFunded, true);
+  d = E.dailyLedger(st, E.simulate(st, { today: T }), T);
+  const s = d.shortfalls.find((x) => x.id === 'uni');
+  assert.ok(s && s.reserve, 'الجامعة قبل اكتمال الاحتياطي');
+  assert.equal(s.short, KD(150));
+  // الاحتياطي لا يُستعمل للديون: حتى مع فائض في يناير يبقى 450 للجامعة
+  const st2 = mode1();
+  ok(A.addExtra(st2, { month: '2027-01', name: 'مستلم', amount: KD(1000), status: 'received', date: '2026-11-05' }, T));
+  const sim2 = audit(st2, T, 'reserve-not-for-debts');
+  assert.equal(sim2.byKey['2027-01'].reserves[0].projHold, KD(450));
+  assert.equal(sim2.byKey['2027-02'].lines.find((l) => l.id === 'uni').potCover, KD(450));
+  const totalUniCash = sim2.months.reduce((a, m) => a + m.reserves.reduce((b, x) => b + x.projHold, 0) + m.lines.filter((l) => l.id === 'uni').reduce((b, l) => b + l.regUsed - l.potCover, 0), 0);
+  assert.equal(totalUniCash, KD(450), 'الجامعة تخرج من النقد مرة واحدة');
+});
+
+test('تكرار وحفظ مزدوج: التاريخ غير المعروف مسموح للتاريخي فقط، ولا يُكرر مع إعادة الضغط', () => {
+  const st = fresh();
+  assert.notEqual(A.addPayment(st, { itemId: 'furniture', month: '2026-11', amount: KD(460), dateUnknown: true }, { today: T }), null, 'شهر حالي يحتاج تاريخًا');
+  ok(A.addPayment(st, { itemId: 'furniture', month: '2026-09', amount: KD(460), dateUnknown: true, opId: 'x1' }, { today: T }));
+  assert.equal(A.addPayment(st, { itemId: 'furniture', month: '2026-09', amount: KD(460), dateUnknown: true, opId: 'x1' }, { today: T }), A.ALREADY_SAVED);
+  assert.equal(A.addPayment(st, { itemId: 'furniture', month: '2026-09', amount: KD(460), dateUnknown: true }, { today: T }), A.DUPLICATE);
+  assert.equal(st.payments.length, 1);
+  assert.equal(E.simulate(st, { today: T }).byKey['2026-11'].cashStart, 0, 'لا أثر نقدي');
+  // تعديل الدفعة يحفظ «تاريخ غير معروف» ولا يرفض نفسه كتكرار
+  ok(A.updatePayment(st, st.payments[0].id, { amount: KD(400) }, { today: T }));
+  assert.equal(st.payments[0].date, null);
+  assert.equal(st.payments.length, 1);
+  audit(st, T, 'unknown-date');
 });

@@ -27,7 +27,9 @@ export function verify(state, { today, assumeHistory = false, until = null } = {
   const conf = state.payments.filter((p) => p.confirmed !== false);
   const sum = (arr) => arr.reduce((a, x) => a + x.amount, 0);
   const paidOf = (m, id, kind) => sum(conf.filter((p) => p.month === m && p.itemId === id && p.kind === kind));
-  const paidAfterOf = (m, id, kind) => sum(conf.filter((p) => p.month === m && p.itemId === id && p.kind === kind && after(p.date)));
+  // دفعة تاريخية بلا تاريخ تنفيذ معروف: لا أثر نقدي
+  const payAfter = (p) => p.date !== null && p.date !== undefined && after(p.date);
+  const paidAfterOf = (m, id, kind) => sum(conf.filter((p) => p.month === m && p.itemId === id && p.kind === kind && payAfter(p)));
   const pendOf = (m, id) => sum(state.payments.filter((p) => p.confirmed === false && p.month === m && p.itemId === id && p.kind === 'regular'));
 
   // ── أحداث نقدية مؤرخة لكل شهر توقعي
@@ -52,7 +54,7 @@ export function verify(state, { today, assumeHistory = false, until = null } = {
     route(md.rent?.allocMonth || m, income(md.rent, S.rentDefault, dIn(kAdd(m, 1), S.rentArrivalDay)));
   }
   const toCashMonth = (fiscal, date) => { if (!after(date)) return null; return fiscal >= F ? fiscal : F; };
-  for (const p of conf) if (p.month < F) { const t = toCashMonth(p.month, p.date); if (t) ev(t, p.date, -p.amount); }
+  for (const p of conf) if (p.month < F && payAfter(p)) { const t = toCashMonth(p.month, p.date); if (t) ev(t, p.date, -p.amount); }
   for (const p of state.visa.payments) if (p.cashMonth) { const t = toCashMonth(p.cashMonth, p.date); if (t) ev(t, p.date, -p.amount); }
   for (const e of state.extras) if (e.status === 'received') { const t = toCashMonth(e.month, e.date); if (t) ev(t, e.date, e.amount); }
   for (const r of state.reserves || []) if (r.heldDate) { const t = toCashMonth(r.month, r.heldDate); if (t) ev(t, r.heldDate, -r.amount); }

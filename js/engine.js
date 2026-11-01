@@ -9,7 +9,7 @@
 // 4) العجز ليس دينًا إضافيًا: هو جزء من الرصيد الحقيقي، ويُسقف به.
 import { parseKD } from './money.js';
 
-export const SCHEMA = 3;
+export const SCHEMA = 4;
 export const DEFAULT_PRIORITY = ['violations', 'furniture', 'p_suhail', 'p_shafiq', 'p_electric', 'p_abuosama'];
 const SEEDED_PERSONS = ['p_suhail', 'p_shafiq', 'p_electric', 'p_abuosama'];
 const MAX_MONTHS = 600;
@@ -54,7 +54,7 @@ export const monthLabel = (key) => {
   return `${AR_MONTHS[m - 1]} ${y}`;
 };
 export const dateLabel = (date) => {
-  if (!date) return '';
+  if (!date) return 'تاريخ غير معروف';
   const [y, m, d] = date.split('-').map(Number);
   return `${d} ${AR_MONTHS[m - 1]} ${y}`;
 };
@@ -83,6 +83,7 @@ export function seedReserves() {
   return [{
     id: 'res_uni', name: 'احتياطي الجامعة', icon: '🎓', month: '2027-01', amount: KD(450),
     targetItem: 'uni', targetMonth: '2027-02', heldDate: null,
+    sources: [{ kind: 'salary', ofMonth: '2027-01', amount: KD(300) }, { kind: 'rent', ofMonth: '2027-01', amount: KD(150) }],
     note: '300 من راتب يناير + 150 من بدل إيجار يناير (يصل في فبراير) — يُحجز مرة واحدة ويُستخدم لدفع رسوم الجامعة.',
   }];
 }
@@ -98,7 +99,8 @@ export function createSeedState(nowIso = new Date().toISOString()) {
     { id: 'p_suhail', type: 'debt', group: 'person', name: 'سهيل', icon: '👤', opening: KD(550), mandatory: 0, extra: 'allow', start: '2026-09', order: 10, verified: false },
     { id: 'p_shafiq', type: 'debt', group: 'person', name: 'شفيق', icon: '👤', opening: KD(24), mandatory: 0, extra: 'allow', start: '2026-09', order: 11, verified: false },
     { id: 'p_electric', type: 'debt', group: 'person', name: 'الكهربائي', icon: '👤', opening: KD(20), mandatory: 0, extra: 'allow', start: '2026-09', order: 12, verified: false },
-    { id: 'p_abuosama', type: 'debt', group: 'person', name: 'أبو أسامة', icon: '👤', opening: KD(450), mandatory: 0, extra: 'allow', start: '2026-09', order: 13, verified: false },
+    { id: 'p_abuosama', type: 'debt', group: 'person', name: 'أبو أسامة', icon: '👤', opening: KD(450), mandatory: 0, extra: 'allow', start: '2026-09', order: 13, verified: true,
+      note: 'دين قائم مؤكد (450) حسب المستخدم.' },
     { id: 'maid', type: 'expense', name: 'الخادمة', icon: '🧹', carry: true, schedule: [{ from: '2026-09', amount: KD(140) }], order: 20 },
     { id: 'bills', type: 'expense', name: 'الفواتير', icon: '💡', carry: true, schedule: [{ from: '2026-09', amount: KD(100) }, { from: '2026-11', amount: KD(80) }], order: 21 },
     { id: 'personal', type: 'expense', name: 'المصروف الشخصي', icon: '👛', carry: false, schedule: [{ from: '2026-09', amount: KD(190) }], order: 22 },
@@ -251,7 +253,8 @@ export function simulate(state, opts = {}) {
 
   const confirmed = baseline ? [] : confirmedPayments(state);
   const payMap = sumBy(confirmed, (p) => `${p.month}|${p.itemId}|${p.kind}`);
-  const payCashMap = sumBy(confirmed.filter((p) => afterAnchor(p.date)), (p) => `${p.month}|${p.itemId}|${p.kind}`);
+  // دفعة تاريخية بتاريخ غير معروف (date=null) مُضمَّنة في الماضي: لا أثر نقدي لها
+  const payCashMap = sumBy(confirmed.filter((p) => p.date && afterAnchor(p.date)), (p) => `${p.month}|${p.itemId}|${p.kind}`);
   const pendingMap = sumBy(baseline ? [] : state.payments.filter((p) => p.confirmed === false), (p) => `${p.month}|${p.itemId}|${p.kind}`);
   // التصحيحات تُخزن كفرق (delta)
   const adjMap = sumBy(baseline ? [] : state.adjustments.map((a) => ({ itemId: a.itemId, amount: a.delta })), (a) => a.itemId);
@@ -266,7 +269,7 @@ export function simulate(state, opts = {}) {
   const cashAdj = new Map();
   const addCash = (m, amt) => { if (m) cashAdj.set(m, (cashAdj.get(m) || 0) + amt); };
   if (!baseline) {
-    for (const p of confirmed) if (p.month < F) addCash(cashMonthOf(p.month, p.date), -p.amount);
+    for (const p of confirmed) if (p.month < F && p.date) addCash(cashMonthOf(p.month, p.date), -p.amount);
     for (const p of state.visa.payments) if (p.cashMonth) addCash(cashMonthOf(p.cashMonth, p.date), -p.amount);
     for (const e of state.extras) if (e.status === 'received') addCash(cashMonthOf(e.month, e.date), e.amount);
     for (const r of state.reserves || []) if (r.heldDate) addCash(cashMonthOf(r.month, r.heldDate), -r.amount);
@@ -318,6 +321,7 @@ export function simulate(state, opts = {}) {
 
   let cash = 0;
   let endIdx = null;
+  let allKnownIdx = null;
   const months = [];
 
   for (let k = 0; k < MAX_MONTHS; k++) {
@@ -573,6 +577,7 @@ export function simulate(state, opts = {}) {
     const allStarted = debts.every((d) => key >= d.start);
     const allZero = allStarted && debts.every((d) => isUnverifiedPerson(d) || (bal[d.id] ?? d.opening) <= 0);
     if (allZero && endIdx === null) endIdx = idx;
+    if (allStarted && allKnownIdx === null && debts.every((d) => (bal[d.id] ?? d.opening) <= 0)) allKnownIdx = idx;
     if (endIdx !== null && idx >= untilIdx) break;
   }
 
@@ -581,7 +586,10 @@ export function simulate(state, opts = {}) {
   return {
     months, F, anchorDate, anchorAmount,
     timing: timing.filter((t) => t.alloc <= monthKey(Math.max(startIdx, endIdx ?? routedTo))),
+    // endMonth: إغلاق الديون الداخلة في الجدولة. allDebtsEndMonth: إغلاق كل الديون المعروفة
+    // (null إن بقي دين مستثنى برصيد موجب — لا يجوز وصف الخطة بأنها خالصة).
     endMonth: endIdx === null ? null : monthKey(endIdx),
+    allDebtsEndMonth: allKnownIdx === null ? null : monthKey(allKnownIdx),
     byKey: Object.fromEntries(months.map((m) => [m.key, m])),
     excludedPersons,
   };
@@ -614,7 +622,7 @@ export function dashboard(state, sim, baseSim = null) {
   const base = baseSim ? baseSim.endMonth : null;
   const end = sim.endMonth;
   const delta = end && base ? monthIndex(end) - monthIndex(base) : null;
-  return { initial, original, paid, reduced: paid, remaining, inferred, progressTenths, endMonth: end, baselineEnd: base, deltaMonths: delta };
+  return { initial, original, paid, reduced: paid, remaining, inferred, progressTenths, endMonth: end, allEnd: sim.allDebtsEndMonth, excluded: sim.excludedPersons, baselineEnd: base, deltaMonths: delta };
 }
 
 /* ───────────── الفيزا ───────────── */
@@ -775,10 +783,127 @@ export function migrate(input) {
     state.log.push({ ts: now, text: `تحديث نموذج البيانات إلى الإصدار 3 دون حذف أي بيانات${notes.length ? ` (${[...new Set(notes)].join('، ')})` : ''}.` });
     changed = true;
   }
+  if ((state.schema || 3) < 4) {
+    const notes = [];
+    const r = (state.reserves || []).find((x) => x.id === 'res_uni');
+    if (r && !r.sources) {
+      r.sources = [{ kind: 'salary', ofMonth: r.month, amount: Math.min(r.amount, KD(300)) }, { kind: 'rent', ofMonth: r.month, amount: Math.max(0, r.amount - KD(300)) }];
+      notes.push('مصادر احتياطي الجامعة: 300 من الراتب + 150 من بدل الإيجار');
+    }
+    const abu = state.items.find((i) => i.id === 'p_abuosama');
+    if (abu && abu.verified === false) { abu.verified = true; notes.push('أبو أسامة دين قائم مؤكد (حسب المستخدم)'); }
+    state.schema = 4;
+    state.log.push({ ts: now, text: `تحديث نموذج البيانات إلى الإصدار 4 دون حذف أي بيانات${notes.length ? ` (${notes.join('، ')})` : ''}.` });
+    changed = true;
+  }
   return { state, changed };
 }
 
-/* ───────────── موثوقية التوقع ───────────── */
+/* ───────────── تمويل الاحتياطي: المصدر والتوقيت ───────────── */
+
+/**
+ * يبيّن لكل مصدر من مصادر الاحتياطي: المبلغ، تاريخ وصوله (المتوقع أو الفعلي)، متى يصبح متاحًا،
+ * ومتى يكتمل التمويل، ومتى يُحجز، وشهر الاستخدام وتاريخ استحقاق البند المستهدف إن وُجد.
+ */
+export function reserveFunding(state, r) {
+  const sources = (r.sources && r.sources.length ? r.sources : [{ kind: 'salary', ofMonth: r.month, amount: r.amount }]).map((src) => {
+    const inc = src.kind === 'rent' ? rentFor(state, src.ofMonth) : salaryFor(state, src.ofMonth);
+    const date = inc.received ? inc.receivedDate : inc.date;
+    return { ...src, date, received: inc.received };
+  });
+  const completeDate = sources.reduce((a, x) => (x.date > a ? x.date : a), '0000-00-00');
+  const dueDate = state.months[r.targetMonth]?.dueDates?.[r.targetItem] || dueDayDate(state, r.targetItem, r.targetMonth);
+  return {
+    sources, completeDate, heldDate: r.heldDate || null, targetMonth: r.targetMonth, targetItem: r.targetItem, dueDate,
+    sumOk: sources.reduce((a, x) => a + x.amount, 0) === r.amount,
+    dueBeforeFunded: !!dueDate && dueDate < completeDate,
+  };
+}
+
+/** تاريخ الاستحقاق من الإعداد العام للبند (يوم ثابت) إن حدده المستخدم، وإلا null — لا يُخترع موعد */
+export function dueDayDate(state, itemId, month) {
+  const it = itemById(state, itemId);
+  return it && it.dueDay ? dateIn(month, it.dueDay) : null;
+}
+
+/* ───────────── التحقق اليومي من توفر النقد ───────────── */
+
+/**
+ * دفتر يومي لفترة التوقع: يبدأ بالرصيد النقدي، ويضيف الدخل بتاريخ وصوله، ويطرح الحقائق المؤكدة بتواريخها،
+ * ويطرح كل التزام متوقع في تاريخ استحقاقه. الالتزام بلا تاريخ استحقاق لا يُخترع له موعد: يُدرج «غير محسوم».
+ * في اليوم نفسه يدخل الدخل قبل الدفع. النتيجة لكل حالة نقص: التاريخ، البند، المبلغ الناقص.
+ */
+export function dailyLedger(state, sim, today = kuwaitToday()) {
+  const F = sim.F;
+  const events = [];
+  const anchorDate = sim.anchorDate;
+  const after = (d) => !!d && d > anchorDate;
+  const lastKey = sim.months[sim.months.length - 1].key;
+  // الرصيد الافتتاحي
+  events.push({ date: addDays(anchorDate, 0), order: 0, amount: sim.anchorAmount, label: 'الرصيد النقدي' });
+  // الدخل
+  for (let i = monthIndex(state.settings.planStart); i <= monthIndex(lastKey); i++) {
+    const mk = monthKey(i);
+    for (const [kind, inc] of [['salary', salaryFor(state, mk)], ['rent', rentFor(state, mk)]]) {
+      const alloc = inc.allocMonth;
+      const date = inc.received ? inc.receivedDate : inc.date;
+      const amt = inc.received ? inc.receivedAmount : inc.amount;
+      if (!amt) continue;
+      if (inc.received ? !after(date) : alloc < F) continue;
+      events.push({ date: date < dateIn(F, 1) ? dateIn(F, 1) : date, order: 1, amount: amt, label: `${kind === 'rent' ? 'بدل إيجار' : 'راتب'} ${monthLabel(mk)}` });
+    }
+  }
+  for (const e of state.extras) {
+    if (e.status === 'received' && after(e.date)) events.push({ date: e.date, order: 1, amount: e.amount, label: e.name });
+    if (e.status === 'adopted' && e.month >= F) events.push({ date: dateIn(e.month, 1), order: 1, amount: e.amount, label: e.name });
+  }
+  for (const r of state.recurring || []) for (const m of sim.months) if (!m.past && r.start <= m.key && (!r.end || m.key <= r.end)) events.push({ date: dateIn(m.key, 1), order: 1, amount: r.amount, label: 'زيادة معتمدة' });
+  // الحقائق المؤكدة
+  for (const p of confirmedPayments(state)) if (after(p.date)) events.push({ date: p.date, order: 2, amount: -p.amount, label: `دفعة ${itemById(state, p.itemId)?.name || ''}`, fact: true, potItem: p.itemId, potMonth: p.month });
+  for (const p of state.visa.payments) if (p.cashMonth && after(p.date)) events.push({ date: p.date, order: 2, amount: -p.amount, label: 'سداد الفيزا', fact: true });
+  // الاحتياطيات: تُحجز من كل مصدر عند وصوله (أو بتاريخ الحجز المؤكد)
+  const potEvents = [];
+  for (const r of state.reserves || []) {
+    const f = reserveFunding(state, r);
+    if (r.heldDate) {
+      if (after(r.heldDate)) events.push({ date: r.heldDate, order: 2, amount: -r.amount, label: `حجز ${r.name}`, fact: true });
+      potEvents.push({ date: r.heldDate, r, amount: r.amount });
+    } else if (r.month >= F) {
+      for (const src of f.sources) {
+        events.push({ date: src.date, order: 3, amount: -src.amount, label: `حجز ${r.name} من ${src.kind === 'rent' ? 'بدل الإيجار' : 'الراتب'}`, hold: true, r });
+        potEvents.push({ date: src.date, r, amount: src.amount });
+      }
+    }
+  }
+  // الالتزامات المتوقعة بتواريخ استحقاقها
+  const undated = [];
+  for (const m of sim.months) {
+    if (m.past) continue;
+    for (const l of m.lines) {
+      const cashPart = (l.regRealized && l.carry ? 0 : Math.max(0, l.projReg - Math.max(0, l.potCover - Math.min(l.potCover, l.paidReg)))) + l.projArr;
+      const potPart = Math.max(0, l.potCover - Math.min(l.potCover, l.paidReg));
+      if (cashPart + potPart <= 0) continue;
+      const due = state.months[m.key]?.dueDates?.[l.id] || dueDayDate(state, l.id, m.key);
+      if (!due) { undated.push({ month: m.key, id: l.id, name: l.name, amount: cashPart + potPart }); continue; }
+      if (cashPart > 0) events.push({ date: due, order: 4, amount: -cashPart, label: `${l.name} (${monthLabel(m.key)})`, due: true, month: m.key, id: l.id });
+      if (potPart > 0) events.push({ date: due, order: 4, amount: 0, potNeed: potPart, label: `${l.name} من الاحتياطي (${monthLabel(m.key)})`, due: true, month: m.key, id: l.id });
+    }
+  }
+  events.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.order - b.order));
+  potEvents.sort((a, b) => (a.date < b.date ? -1 : 1));
+  let bal = 0; let min = Infinity; let minDate = null;
+  const shortfalls = [];
+  for (const e of events) {
+    bal += e.amount;
+    if (e.potNeed) {
+      const avail = potEvents.filter((x) => x.date <= e.date).reduce((a, x) => a + x.amount, 0);
+      if (avail < e.potNeed) shortfalls.push({ date: e.date, label: e.label, short: e.potNeed - avail, reserve: true, month: e.month, id: e.id });
+    }
+    if (bal < min) { min = bal; minDate = e.date; }
+    if (bal < 0 && (e.due || e.hold)) shortfalls.push({ date: e.date, label: e.label, short: -bal, month: e.month, id: e.id });
+  }
+  return { status: shortfalls.length ? 'shortfall' : undated.length ? 'unresolved' : 'ok', shortfalls, undated, minBalance: min === Infinity ? 0 : min, minDate, events };
+}
 
 export function planReliability(state, sim, today = kuwaitToday()) {
   const unknownPast = [];

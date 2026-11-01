@@ -95,10 +95,11 @@ test('[3] تسجيل سداد سهيل وشفيق والكهربائي يخفض 
   for (const id of ['p_suhail', 'p_shafiq', 'p_electric']) assert.equal(E.itemById(st, id).closedConfirmed, false);
   ok(A.confirmClose(st, 'p_suhail'));
   assert.notEqual(A.confirmClose(st, 'p_abuosama'), null, 'لا إغلاق مع رصيد متبقٍ');
-  // ديون الأشخاص غير المتحقق منها لا تُجدول تلقائيًا
+  // ديون الأشخاص غير المتحقق منها لا تُجدول تلقائيًا؛ أبو أسامة دين قائم مؤكد (حسب المستخدم)
   const s2 = sim(fresh(), { until: '2027-08' });
-  for (const m of s2.months) for (const l of m.lines) if (l.group === 'person') assert.equal(l.regUsed, 0, `${m.key} ${l.name}`);
-  assert.deepEqual(s2.excludedPersons.map((x) => x.id), ['p_suhail', 'p_shafiq', 'p_electric', 'p_abuosama']);
+  for (const m of s2.months) for (const l of m.lines) if (l.unverified) assert.equal(l.regUsed, 0, `${m.key} ${l.name}`);
+  assert.deepEqual(s2.excludedPersons.map((x) => x.id), ['p_suhail', 'p_shafiq', 'p_electric']);
+  assert.equal(E.itemById(fresh(), 'p_abuosama').verified, true);
 });
 
 /* ───────── [4] فائض سبتمبر/أكتوبر الوهمي ───────── */
@@ -407,7 +408,7 @@ test('[21] ترحيل بيانات الإصدارين 1 و2 دون فقدان أ
   const raw = JSON.parse(JSON.stringify(v1));
   const { state: v3, changed } = E.migrate(JSON.parse(JSON.stringify(raw)));
   assert.equal(changed, true);
-  assert.equal(v3.schema, 3);
+  assert.equal(v3.schema, E.SCHEMA);
   assert.equal(v3.payments.length, raw.payments.length, 'لا تكرار');
   assert.deepEqual(v3.payments.map((p) => [p.id, p.amount, p.month, p.date, p.kind]), raw.payments.map((p) => [p.id, p.amount, p.month, p.date, p.kind]));
   assert.ok(v3.payments.every((p) => p.confirmed === true));
@@ -417,6 +418,8 @@ test('[21] ترحيل بيانات الإصدارين 1 و2 دون فقدان أ
   assert.deepEqual(v3.settings.cash, { amount: 0, date: null, note: '' });
   assert.equal(v3.reserves.length, 1);
   assert.equal(E.itemById(v3, 'p_suhail').verified, false);
+  assert.equal(E.itemById(v3, 'p_abuosama').verified, true, 'أبو أسامة دين قائم مؤكد');
+  assert.equal(v3.reserves[0].sources.length, 2);
   assert.equal(E.itemById(v3, 'shuoon').extra, 'none');
   assert.equal(E.debtStatus(v3, E.itemById(v3, 'furniture')).remaining, KD(5050));
   const again = E.migrate(v3);

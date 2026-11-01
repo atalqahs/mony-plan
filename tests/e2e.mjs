@@ -10,7 +10,8 @@ const ctx = await b.newContext({ ...devices['iPhone 13'], timezoneId: 'Asia/Kuwa
 const p = await ctx.newPage();
 const errors = [];
 p.on('pageerror', (e) => errors.push(e.message));
-p.on('dialog', (d) => d.accept());
+let dialogMode = 'accept';
+p.on('dialog', (d) => (dialogMode === 'dismiss' ? d.dismiss() : d.accept()));
 await p.goto(URL);
 await p.waitForSelector('.grid');
 const step = (n) => console.log('✓', n);
@@ -78,7 +79,7 @@ const v2 = await p.evaluate(() => {
 });
 await p.reload(); await p.waitForSelector('.grid');
 const mig = await p.evaluate(() => { const s = window.__mfp.state; return { schema: s.schema, reserves: s.reserves.length, cash: s.settings.cash.amount, closed: s.months['2026-09'].closed, payments: s.payments.map((x) => [x.id, x.amount, x.month, x.kind]), purchases: s.visa.purchases.length, plan: s.months['2026-11'].plan.violations }; });
-assert.equal(mig.schema, 3); assert.equal(mig.reserves, 1); assert.equal(mig.cash, 0); assert.equal(mig.closed, true);
+assert.equal(mig.schema, 4); assert.equal(mig.reserves, 1); assert.equal(mig.cash, 0); assert.equal(mig.closed, true);
 assert.deepEqual(mig.payments, v2.payments); assert.equal(mig.purchases, v2.purchases); assert.equal(mig.plan, v2.plan);
 step('[21] بيانات الإصدار السابق تُرحّل بعد التحديث دون فقدان أو تكرار');
 
@@ -142,7 +143,28 @@ for (let i = 0; i < 2; i++) {
   await p.click('.sheet [data-a="pay"]');
 }
 assert.ok(dialogs.some((m) => m.includes('مطابقة')), 'لا تنبيه تكرار');
-step('إدخال دفعتين متطابقتين يظهر تنبيه التكرار');
+step('دفعتان متطابقتان: تنبيه، وتُحفظ الثانية فقط بعد تأكيد أنها عملية مستقلة');
+// رفض التكرار عند الإلغاء
+const nDup = await p.evaluate(() => window.__mfp.state.payments.length);
+dialogMode = 'dismiss';
+await p.click('.li .chk[data-id="maid"]');
+await p.fill('.sheet [name="amount"]', '10');
+await p.fill('.sheet [name="date"]', await p.evaluate(() => window.__mfp.today));
+await p.click('.sheet [data-a="pay"]');
+dialogMode = 'accept';
+assert.equal(await p.evaluate(() => window.__mfp.state.payments.length), nDup, 'التكرار المرفوض لم يُحفظ');
+await p.click('.sheet [data-close]');
+step('إلغاء تنبيه التكرار يمنع الحفظ');
+// ضغط مزدوج سريع على زر الحفظ ثم تحديث وإعادة فتح
+const nDbl = await p.evaluate(() => window.__mfp.state.payments.length);
+await p.click('.li .chk[data-id="personal"]');
+await p.fill('.sheet [name="amount"]', '7');
+await p.fill('.sheet [name="date"]', await p.evaluate(() => window.__mfp.today));
+await p.evaluate(() => { const b = document.querySelector('.sheet [data-a="pay"]'); b.click(); b.click(); b.click(); });
+assert.equal(await p.evaluate(() => window.__mfp.state.payments.length), nDbl + 1, 'الضغط المتكرر حفظ مرة واحدة');
+await p.reload(); await p.waitForSelector('.grid');
+assert.equal(await p.evaluate(() => window.__mfp.state.payments.length), nDbl + 1, 'بعد التحديث');
+step('الضغط المتكرر على الحفظ يسجل العملية مرة واحدة (وبعد إعادة الفتح)');
 
 // انقطاع أثناء الحفظ: إعادة تحميل فورية بعد العملية
 const nBefore = await p.evaluate(() => window.__mfp.state.payments.length);
@@ -182,6 +204,17 @@ for (const sel of ['[data-act="settings"]', '[data-act="add"]', '[data-act="mont
   assert.ok(over <= 0, `ورقة ${sel} أعرض من الشاشة`);
   await p.click('.sheet [data-close]');
 }
+// نافذة احتياطي الجامعة (يناير): مصادر التمويل وتواريخها
+await p.evaluate(() => localStorage.setItem('mfp-view-month', '2027-01')); await p.reload(); await p.waitForSelector('.grid');
+await p.click('.li [data-act="reserve"]');
+await p.waitForSelector('.sheet');
+const resTxt = await p.textContent('.sheet');
+assert.ok(resTxt.includes('22 يناير 2027') && resTxt.includes('1 فبراير 2027') && resTxt.includes('300.000') && resTxt.includes('150.000'), 'مصادر الاحتياطي وتواريخها');
+assert.ok(await p.evaluate(() => { const sh = document.querySelector('.sheet'); return sh.scrollWidth <= sh.clientWidth; }));
+await p.click('.sheet [data-close]');
+assert.ok((await p.textContent('[aria-label="السيولة"]')).includes('التحقق اليومي'));
+step('احتياطي الجامعة يعرض المصدر وتاريخ الوصول والاكتمال والاستخدام؛ التحقق اليومي ظاهر');
+
 step('[23] العرض على عروض iPhone (320/375/390/414/430) بلا تمرير أفقي، وكل الأوراق تعمل');
 
 assert.deepEqual(errors, []);

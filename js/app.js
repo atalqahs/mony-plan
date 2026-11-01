@@ -36,6 +36,7 @@ let state = null;
 let today = E.kuwaitToday();
 const view = { month: null, sc: { type: 'monthly', amount: '', start: null, end: '', month: null } };
 let sim = null;
+let daily = null;
 
 function lsGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
 function lsSet(k, v) { try { localStorage.setItem(k, v); } catch { /* ignore */ } }
@@ -51,9 +52,20 @@ function toast(msg, err = false) {
 
 /** تسجيل دفعة مع تنبيه عند وجود دفعة مطابقة تمامًا (منع التكرار غير المقصود) */
 function addPay(data, msg) {
-  const dup = A.findDuplicatePayment(state, data);
-  if (dup && !confirm(`توجد دفعة مطابقة مسجلة مسبقًا (${fmtKD(dup.amount)} د.ك بتاريخ ${E.dateLabel(dup.date)}). تسجيلها مرة ثانية؟`)) return false;
-  return commit((s) => A.addPayment(s, data, { today }), msg);
+  return guarded(data, (d) => A.addPayment(state, d, { today }), (dup) => `توجد دفعة مطابقة تمامًا (${fmtKD(data.amount)} د.ك، ${E.dateLabel(data.date || null)}). هل هذه عملية مستقلة فعلًا؟ اختر «إلغاء» إن كانت تكرارًا.`, msg);
+}
+/** حفظ مع منع التكرار: مطابقة تامة تُرفض ما لم يؤكد المستخدم أنها عملية مستقلة؛ نفس opId لا يُحفظ مرتين */
+function guarded(data, run, dupMsg, msg) {
+  let err = run(data);
+  if (err === A.DUPLICATE) {
+    if (!confirm(dupMsg())) { toast('لم تُسجل — عملية مكررة', true); return false; }
+    err = run({ ...data, allowDuplicate: true });
+  }
+  if (err) { toast(err, true); return false; }
+  saveState(state);
+  render();
+  if (msg) toast(msg);
+  return true;
 }
 /** تنفيذ عملية + حفظ + إعادة رسم */
 function commit(fn, okMsg) {
@@ -90,6 +102,8 @@ function render() {
   const dash = E.dashboard(state, sim, baseSim);
   const rel = E.planReliability(state, sim, today);
   rel.histEnd = rel.historyIncomplete ? E.simulate(state, { today, assumeHistory: true }).endMonth : null;
+  daily = E.dailyLedger(state, sim, today);
+  rel.daily = daily;
   const vs = E.visaSummary(state, today);
   const m = sim.byKey[view.month];
   void winStart;
@@ -148,7 +162,7 @@ function dashboardCard(d, rel) {
   }
   const estimate = !rel.reliable;
   if (rel.historyIncomplete && d.deltaMonths !== null) { deltaTxt = 'غير مؤكد'; deltaCls = 'amber'; }
-  const left = d.endMonth ? E.monthIndex(d.endMonth) - E.monthIndex(today.slice(0, 7)) : null;
+  const left = d.allEnd ? E.monthIndex(d.allEnd) - E.monthIndex(today.slice(0, 7)) : null;
   const warn = [];
   if (rel.historyIncomplete) warn.push(`السجل التاريخي غير مكتمل: ${rel.unknownPast.length} بندًا في الأشهر الماضية غير مسجل (لا نعرف هل دُفع). الأرصدة لا تُخفَّض ولا يُحتسب عجز حتى تسجلها أو تقفل الشهر.${rel.histEnd ? ` لو كانت مدفوعة حسب الخطة يصبح الإغلاق التقديري ${E.monthLabel(rel.histEnd)}.` : ''}`);
   if (!rel.cashEntered) warn.push('لم يُدخل الرصيد النقدي المتاح — يُفترض صفرًا ولا تُستخدم أي فوائض من أشهر سابقة.');
@@ -156,6 +170,7 @@ function dashboardCard(d, rel) {
   if (rel.excludedPersons.length) warn.push(`ديون أشخاص بانتظار التحقق خارج الجدولة وموعد الإغلاق: ${rel.excludedPersons.map((x) => `${esc(x.name)} ${fmtKD(x.remaining)}`).join('، ')}.`);
   if (rel.overdueIncome.length) warn.push(`دخل متوقع تجاوز موعده ولم يُؤكد: ${rel.overdueIncome.map((x) => `${x.kind === 'rent' ? 'بدل إيجار' : 'راتب'} ${E.monthLabel(x.ofMonth)} (${E.dateLabel(x.date)})`).join('، ')}. أكّد استلامه أو عدّل قيمته.`);
   if (rel.timing.length) warn.push(`دخل يصل بعد بداية الشهر التالي فلا يُستعمل قبل وصوله: ${rel.timing.map((t) => `${t.kind === 'rent' ? 'بدل إيجار' : 'راتب'} ${E.monthLabel(t.ofMonth)} يصل ${E.dateLabel(t.date)} ويُحتسب في ${E.monthLabel(t.cashMonth)}`).join('، ')}.`);
+  if (rel.daily && rel.daily.shortfalls.length) warn.push(`التحقق اليومي: ${rel.daily.shortfalls.length} حالة يُستحق فيها التزام قبل توفر المال (أولها ${esc(rel.daily.shortfalls[0].label)} في ${E.dateLabel(rel.daily.shortfalls[0].date)}).`);
   if (rel.gaps.length) warn.push(`السيولة المتوقعة لا تكفي الالتزامات في ${rel.gaps.slice(0, 3).map((g) => E.monthLabel(g.key)).join('، ')}${rel.gaps.length > 3 ? ` و${rel.gaps.length - 3} أشهر أخرى` : ''} — الخطة تمتد تبعًا لذلك.`);
   return `
   <section class="card" aria-label="لوحة الديون">
@@ -172,11 +187,12 @@ function dashboardCard(d, rel) {
     ${d.original !== d.initial ? `<div class="note">عند بداية الخطة ${kd(d.initial)} د.ك، وبعد تصحيحات الأرصدة والديون المضافة ${kd(d.original)} د.ك.</div>` : ''}
     <div class="divider"></div>
     <div class="stats">
-      <div><div class="l">الإغلاق ${estimate ? 'التقديري' : 'المتوقع'}</div><div class="v ${d.endMonth ? '' : 'red'}">${d.endMonth ? E.monthLabel(d.endMonth) : 'غير قابل للتحديد'}</div>${left !== null && left >= 0 ? `<div class="s">بعد ${monthsWord(left)}</div>` : ''}</div>
+      <div><div class="l">إغلاق كل الديون ${estimate ? '(تقديري)' : '(متوقع)'}</div><div class="v ${d.allEnd ? '' : 'amber'}">${d.allEnd ? E.monthLabel(d.allEnd) : 'غير محدد'}</div>${d.allEnd && left !== null && left >= 0 ? `<div class="s">بعد ${monthsWord(left)}</div>` : ''}</div>
       <div><div class="l">الخطة كما كُتبت</div><div class="v">${d.baselineEnd ? E.monthLabel(d.baselineEnd) : '—'}</div></div>
       <div><div class="l">الفرق</div><div class="v ${deltaCls}">${deltaTxt}</div></div>
     </div>
     ${!d.endMonth ? '<div class="alert">لا يمكن إنهاء الخطة وفق الافتراضات الحالية: السيولة المتوقعة لا تكفي. لن يُعرض موعد وهمي.</div>' : ''}
+    ${d.endMonth && !d.allEnd ? `<div class="alert amber">الديون الداخلة في الجدولة تُغلق في ${E.monthLabel(d.endMonth)}، لكن <b>ليست كل الديون</b>: يبقى ${d.excluded.map((x) => `${esc(x.name)} ${fmtKD(x.remaining)}`).join('، ')} خارج الجدولة بانتظار التحقق.</div>` : ''}
     ${warn.map((w) => `<div class="alert amber">${w}</div>`).join('')}
     <div class="note">الموعد محسوب من الأرصدة المرجعية والدفعات المؤكدة والرصيد النقدي المُدخل فقط، مع افتراض وصول الراتب وبدل الإيجار في الأشهر القادمة (توقع غير مستلم). لا يدخل فيه دخل غير مؤكد ولا سيناريوهات.${d.inferred ? ` يشمل الإجمالي ${kd(d.inferred)} د.ك رصيدًا مستنتجًا غير مؤكد (${rel.inferred.map((x) => esc(x.name)).join('، ')}).` : ''}</div>
   </section>`;
@@ -259,7 +275,7 @@ function obligationsCard(m) {
   }).join('');
   const resRows = m.reserves.map((r) => `<div class="li">
       <div class="ic">${r.icon}</div>
-      <div class="main"><div class="name">${esc(r.name)}</div><div class="sub">تخصيص نقدي لاستخدامه في ${E.monthLabel(r.reserve.targetMonth)}${r.held ? `، حُجز ${E.dateLabel(r.reserve.heldDate)}` : r.status === 'unknown' ? '، <span class="amber">غير مسجل</span>' : ''}</div></div>
+      <div class="main row-tap" data-act="reserve" data-id="${r.id}"><div class="name">${esc(r.name)}</div><div class="sub">${reserveSub(r.reserve)}${r.held ? `، حُجز ${E.dateLabel(r.reserve.heldDate)}` : r.status === 'unknown' ? '، <span class="amber">غير مسجل</span>' : ''}</div></div>
       <div class="amt"><div class="a num">${fmtKD(r.planned)}</div><div class="b">${r.held ? 'محجوز' : 'غير محجوز'}</div></div>
       <button class="chk" data-act="reserve-toggle" data-id="${r.id}" aria-label="تأكيد حجز ${esc(r.name)}">${checkSvg(r.status, 0, true)}</button>
     </div>`).join('');
@@ -281,7 +297,7 @@ function arrearsCard(m) {
       <div class="main"><div class="name">${l.icon || ''} ${esc(l.name)}</div></div>
       <div class="amt"><div class="a num">${fmtKD(Math.max(0, l.arrStartC - l.paidArr))}</div><div class="b">العجز المتبقي</div></div>
       <input class="input money arr-in" inputmode="decimal" placeholder="0.000" aria-label="مبلغ السداد من عجز ${esc(l.name)}" data-arr-in="${l.id}">
-      <button class="pill white" data-act="arrears-inline" data-m="${view.month}" data-id="${l.id}">سداد</button>
+      <button class="pill white" data-act="arrears-inline" data-m="${view.month}" data-id="${l.id}" data-op="${E.uid('op')}">سداد</button>
     </div>`).join('');
   const projected = lines.filter((l) => l.arrStartP > 0);
   const projRows = projected.map((l) => `<div class="kv"><span class="k">${l.icon || ''} ${esc(l.name)}</span><span class="v num amber">${fmtKD(l.arrStartP)}</span></div>`).join('');
@@ -370,8 +386,25 @@ function liquidityCard(m) {
     <div class="kv total"><span class="k">السيولة المتبقية المتوقعة</span><span class="v num ${m.cashEnd < 0 ? 'red' : ''}">${fmtKD(m.cashEnd)}</span></div>
     <div class="kv"><span class="k">حالة تنفيذ الخطة</span><span class="v">${status}</span></div>
     ${m.fundingGap > 0 ? `<div class="alert">عجز مالي متوقع: السيولة لا تكفي لتغطية ${kd(m.fundingGap)} د.ك من التزامات هذا الشهر، ويُرحّل كعجز متوقع.</div>` : ''}
+    ${dailyRow(m.key)}
     <div class="note">كل ما ليس «مستلمًا مؤكدًا» هنا توقع. المصاريف الأساسية محجوزة كاملة حتى تُقفل الشهر.</div>
   </section>`;
+}
+
+function reserveSub(r) {
+  const f = E.reserveFunding(state, r);
+  const src = f.sources.map((x) => `${fmtKD(x.amount)} من ${x.kind === 'rent' ? 'بدل إيجار' : 'راتب'} ${E.monthLabel(x.ofMonth)} (${x.received ? 'وصل' : 'يصل'} ${E.dateLabel(x.date)})`).join(' + ');
+  return `${src}؛ يكتمل ${E.dateLabel(f.completeDate)}؛ يُستخدم لـ${esc(E.itemById(state, r.targetItem)?.name || '')} في ${E.monthLabel(r.targetMonth)}${f.dueDate ? ` (استحقاق ${E.dateLabel(f.dueDate)})` : ' (تاريخ الاستحقاق غير محدد)'}${f.dueBeforeFunded ? ' — <span class="red">الاستحقاق قبل اكتمال التمويل</span>' : ''}`;
+}
+function dailyRow(key) {
+  if (!daily) return '';
+  const sf = daily.shortfalls.filter((x) => x.month === key);
+  const und = daily.undated.filter((x) => x.month === key);
+  let html = '';
+  if (sf.length) html += sf.map((x) => `<div class="alert">قبل توفر المال: ${esc(x.label)} يستحق ${E.dateLabel(x.date)} وينقصه ${kd(x.short)} د.ك${x.reserve ? ' (الاحتياطي لم يكتمل بعد)' : ''}.</div>`).join('');
+  if (und.length) html += `<div class="kv"><span class="k">التحقق اليومي</span><span class="v amber">غير محسوم</span></div><div class="note">${und.length} التزامات بلا تاريخ استحقاق (${und.map((x) => esc(x.name)).join('، ')}). لا يُخترع موعد: أدخل يوم الاستحقاق من صفحة البند أو تاريخه لهذا الشهر لتفعيل التحقق.</div>`;
+  else if (!sf.length) html += '<div class="kv"><span class="k">التحقق اليومي</span><span class="v green">المال متوفر في تاريخ كل استحقاق</span></div>';
+  return html;
 }
 
 /* ── ديون الأشخاص ── */
@@ -512,6 +545,7 @@ function lineOf(month, id) {
 
 /** ورقة بند في شهر: تأكيد الدفع، الدفعات، المخطط، الاستحقاق */
 function cellSheet(month, id, focusPay = true) {
+  const opId = E.uid('op'); // يمنع حفظ النافذة نفسها مرتين
   const it = E.itemById(state, id);
   const l = lineOf(month, id);
   if (!it) return;
@@ -534,6 +568,7 @@ function cellSheet(month, id, focusPay = true) {
       ${field('تاريخ الدفع', dateInput('date', defaultDateFor(month)))}
     </div>
     ${field('ملاحظة', '<input class="input" name="note" placeholder="اختياري، مثل: من بدل الإيجار">')}
+    ${month < sim.F ? '<div class="toggle"><span>تاريخ التنفيذ غير معروف (دفعة تاريخية)</span><button class="switch" data-name="nodate" role="switch" aria-checked="false"></button></div>' : ''}
     <div class="toggle"><span>تم السداد فعلًا (دفعة مؤكدة)</span><button class="switch on" data-name="confirmed" role="switch" aria-checked="true"></button></div>
     <div class="note">تُنسب الدفعة إلى خطة ${E.monthLabel(month)} مهما كان تاريخ تنفيذها. الدفعة غير المؤكدة تُحفظ ولا تُخصم من الرصيد حتى تأكيدها.</div>
     ${remainingPlan > 0 ? `<div class="note">دفع مبلغ أقل من ${kd(remainingPlan)} د.ك يُسجّل كدفعة جزئية${l?.carry ? '، والفرق يُرحّل كعجز للشهر التالي' : ''}.</div>` : ''}
@@ -556,7 +591,8 @@ function cellSheet(month, id, focusPay = true) {
     on(sh, '[data-a="pay"]', () => {
       const amount = money(v(sh, 'amount'));
       const confirmed = sw(sh, 'confirmed');
-      if (addPay({ itemId: id, month, amount, date: v(sh, 'date'), note: v(sh, 'note'), confirmed }, confirmed ? 'تم تأكيد الدفع' : 'سُجلت الدفعة بانتظار التأكيد')) closeSheet();
+      const dateUnknown = !!sw(sh, 'nodate');
+      if (addPay({ itemId: id, month, amount, date: dateUnknown ? null : v(sh, 'date'), dateUnknown, note: v(sh, 'note'), confirmed, opId }, confirmed ? 'تم تأكيد الدفع' : 'سُجلت الدفعة بانتظار التأكيد')) closeSheet();
     });
     on(sh, '[data-a="del-pay"]', (e, el) => {
       if (!confirm('حذف هذه الدفعة؟ سيُعاد حساب الخطة.')) return;
@@ -632,6 +668,7 @@ function editPaymentSheet(pid, back) {
 }
 
 function arrearsSheet(month, id) {
+  const opId = E.uid('op'); // يمنع حفظ النافذة نفسها مرتين
   const l = lineOf(month, id);
   const it = E.itemById(state, id);
   if (!l || !it) return;
@@ -642,7 +679,7 @@ function arrearsSheet(month, id) {
     <button class="btn" data-a="pay">تسجيل السداد</button>`, (sh) => {
     on(sh, '[data-a="pay"]', () => {
       const amount = money(v(sh, 'amount'));
-      if (addPay({ itemId: id, month, kind: 'arrears', amount, date: v(sh, 'date') }, 'تم السداد من العجز')) closeSheet();
+      if (addPay({ itemId: id, month, kind: 'arrears', amount, date: v(sh, 'date'), opId }, 'تم السداد من العجز')) closeSheet();
     });
     setTimeout(() => sh.querySelector('[name="amount"]')?.select(), 50);
   });
@@ -706,6 +743,7 @@ function extraSheet(id) {
 
 const EXTRA_LABEL = { allow: 'يسمح بالسداد الإضافي', closeOnly: 'السداد المبكر بإغلاق الرصيد كاملًا فقط', none: 'لا سداد إضافي' };
 function debtSheet(id) {
+  const opId = E.uid('op'); // يمنع حفظ النافذة نفسها مرتين
   const d = E.itemById(state, id);
   if (!d) return;
   const st = E.debtStatus(state, d);
@@ -732,6 +770,7 @@ function debtSheet(id) {
     ${st.remaining > 0 ? `<div class="section-t">سداد</div>
     <div class="row2">${field('المبلغ', moneyInput('pamount', ''))}${field('التاريخ', dateInput('pdate', today))}</div>
     ${field('منسوب لخطة شهر', `<select class="input" name="pmonth">${monthOptions(view.month)}</select>`)}
+    <div class="toggle"><span>تاريخ التنفيذ غير معروف (لدفعة في شهر سابق فقط)</span><button class="switch" data-name="nodate" role="switch" aria-checked="false"></button></div>
     <div class="quick"><button class="pill" data-a="fill-full">المبلغ كاملًا (<span class="num">${fmtKD(st.remaining)}</span>)</button></div>
     <button class="btn" data-a="pay">تسجيل السداد</button>` : ''}
 
@@ -740,6 +779,7 @@ function debtSheet(id) {
     <div class="row2">${field('الرمز', `<input class="input" name="icon" value="${esc(d.icon || '')}">`)}${field('يبدأ من', `<select class="input" name="start">${monthOptions(d.start)}</select>`)}</div>
     <div class="row2">${field('الرصيد المرجعي', moneyInput('opening', d.opening))}${field('القسط الإلزامي الشهري', moneyInput('mandatory', d.mandatory))}</div>
     ${field('السداد الإضافي', `<select class="input" name="extra">${Object.entries(EXTRA_LABEL).map(([k, t]) => `<option value="${k}" ${d.extra === k ? 'selected' : ''}>${t}</option>`).join('')}</select>`)}
+    ${field('يوم الاستحقاق الشهري (اختياري — للتحقق اليومي من توفر المال)', `<input class="input" name="dueday" inputmode="numeric" placeholder="غير محدد" value="${d.dueDay || ''}">`)}
     <button class="btn secondary" data-a="save">حفظ البيانات</button>
 
     <div class="section-t">تصحيح الرصيد الحقيقي</div>
@@ -753,13 +793,14 @@ function debtSheet(id) {
     on(sh, '[data-a="fill-full"]', () => { sh.querySelector('[name="pamount"]').value = inputKD(st.remaining); });
     on(sh, '[data-a="pay"]', () => {
       const amount = money(v(sh, 'pamount'));
-      if (addPay({ itemId: id, month: v(sh, 'pmonth'), amount, date: v(sh, 'pdate') }, 'تم تسجيل السداد')) debtSheet(id);
+      const dateUnknown = !!sw(sh, 'nodate');
+      if (addPay({ itemId: id, month: v(sh, 'pmonth'), amount, date: dateUnknown ? null : v(sh, 'pdate'), dateUnknown, opId }, 'تم تسجيل السداد')) debtSheet(id);
     });
     on(sh, '[data-a="close"]', () => { if (commit((s) => A.confirmClose(s, id, true), 'تم تأكيد الإغلاق')) closeSheet(); });
     on(sh, '[data-a="reopen"]', () => { if (commit((s) => A.confirmClose(s, id, false))) debtSheet(id); });
     on(sh, '[data-a="edit-pay"]', (e, el) => editPaymentSheet(el.dataset.id, () => debtSheet(id)));
     on(sh, '[data-a="save"]', () => {
-      const patch = { name: v(sh, 'name'), icon: v(sh, 'icon'), start: v(sh, 'start'), extra: v(sh, 'extra') };
+      const patch = { name: v(sh, 'name'), icon: v(sh, 'icon'), start: v(sh, 'start'), extra: v(sh, 'extra'), dueDay: v(sh, 'dueday') ? Number(v(sh, 'dueday')) : null };
       const op = money(v(sh, 'opening')); const md = money(v(sh, 'mandatory') || '0');
       if (op !== d.opening) patch.opening = op;
       if (md !== d.mandatory) patch.mandatory = md;
@@ -790,6 +831,7 @@ function expenseSheet(id) {
     ${field('الاسم', `<input class="input" name="name" value="${esc(e.name)}">`)}
     <div class="row2">${field('الرمز', `<input class="input" name="icon" value="${esc(e.icon || '')}">`)}${e.once ? field('الشهر', `<select class="input" name="once">${monthOptions(e.once)}</select>`) : field('ينتهي في', `<select class="input" name="end">${monthOptions(e.endMonth, { allowEmpty: true, emptyLabel: 'مستمر' })}</select>`)}</div>
     <div class="toggle"><span>يُرحّل غير المدفوع كعجز</span><button class="switch ${e.carry ? 'on' : ''}" data-name="carry" role="switch" aria-checked="${!!e.carry}"></button></div>
+    ${field('يوم الاستحقاق الشهري (اختياري)', `<input class="input" name="dueday" inputmode="numeric" placeholder="غير محدد" value="${e.dueDay || ''}">`)}
     <button class="btn secondary" data-a="save">حفظ البيانات</button>
     <button class="btn danger" data-a="del">حذف المصروف</button>`, (sh) => {
     on(sh, '[data-a="sched"]', () => {
@@ -797,7 +839,7 @@ function expenseSheet(id) {
       if (commit((s) => A.setExpenseFrom(s, id, v(sh, 'from'), amount), 'تم التطبيق')) closeSheet();
     });
     on(sh, '[data-a="save"]', () => {
-      const patch = { name: v(sh, 'name'), icon: v(sh, 'icon'), carry: sw(sh, 'carry') };
+      const patch = { name: v(sh, 'name'), icon: v(sh, 'icon'), carry: sw(sh, 'carry'), dueDay: v(sh, 'dueday') ? Number(v(sh, 'dueday')) : null };
       if (e.once) {
         const once = v(sh, 'once');
         patch.once = once;
@@ -845,6 +887,7 @@ function newExpenseSheet() {
 }
 
 function quickPaySheet() {
+  const opId = E.uid('op'); // يمنع حفظ النافذة نفسها مرتين
   const month = view.month;
   const lines = sim.byKey[month].lines.filter((l) => l.type === 'debt' || l.planned > 0);
   openSheet(`${head('تسجيل دفعة', E.monthLabel(month))}
@@ -855,7 +898,7 @@ function quickPaySheet() {
     sh.querySelector('[name="item"]').addEventListener('change', fill); fill();
     on(sh, '[data-a="pay"]', () => {
       const amount = money(v(sh, 'amount'));
-      if (addPay({ itemId: v(sh, 'item'), month, amount, date: v(sh, 'date') }, 'تم تأكيد الدفع')) closeSheet();
+      if (addPay({ itemId: v(sh, 'item'), month, amount, date: v(sh, 'date'), opId }, 'تم تأكيد الدفع')) closeSheet();
     });
   });
 }
@@ -952,6 +995,13 @@ function reserveSheet(id) {
   if (!r) return;
   openSheet(`${head(esc(r.name), 'المبلغ يُحجز مرة واحدة ويُستخدم لدفع البند المستهدف — لا يُحتسب مصروفًا مرتين')}
     ${r.note ? `<div class="note">${esc(r.note)}</div>` : ''}
+    <div class="section-t">مصادر التمويل وتوقيتها</div>
+    ${E.reserveFunding(state, r).sources.map((x) => `<div class="kv"><span class="k">${x.kind === 'rent' ? 'بدل إيجار' : 'راتب'} ${E.monthLabel(x.ofMonth)} — ${x.received ? 'وصل' : 'يصل'} ${E.dateLabel(x.date)}</span><span class="v num">${fmtKD(x.amount)}</span></div>`).join('')}
+    <div class="kv"><span class="k">يكتمل التمويل ويصبح متاحًا كاملًا</span><span class="v">${E.dateLabel(E.reserveFunding(state, r).completeDate)}</span></div>
+    <div class="kv"><span class="k">الحجز</span><span class="v">${r.heldDate ? `مؤكد ${E.dateLabel(r.heldDate)}` : 'متوقع عند وصول كل مصدر'}</span></div>
+    <div class="kv"><span class="k">الاستخدام</span><span class="v">${esc(E.itemById(state, r.targetItem)?.name || '—')} — ${E.monthLabel(r.targetMonth)}${E.reserveFunding(state, r).dueDate ? `، يستحق ${E.dateLabel(E.reserveFunding(state, r).dueDate)}` : '، تاريخ الاستحقاق غير محدد'}</span></div>
+    ${E.reserveFunding(state, r).dueBeforeFunded ? '<div class="alert">تاريخ استحقاق الجامعة قبل اكتمال التمويل.</div>' : ''}
+    <div class="note">الاحتياطي يُستخدم فقط للبند المستهدف ولا يُستعمل لسداد الديون. يخرج من النقد مرة واحدة عند الحجز.</div>
     ${field('المبلغ', moneyInput('amount', r.amount))}
     <div class="row2">${field('شهر الحجز', `<select class="input" name="month">${monthOptions(r.month)}</select>`)}${field('شهر الاستخدام', `<select class="input" name="target">${monthOptions(r.targetMonth)}</select>`)}</div>
     <div class="toggle"><span>تم الحجز فعليًا</span><button class="switch ${r.heldDate ? 'on' : ''}" data-name="held" role="switch" aria-checked="${!!r.heldDate}"></button></div>
@@ -988,6 +1038,7 @@ function openItem(id) {
 
 /* ── الفيزا ── */
 function visaBuySheet(id) {
+  const opId = E.uid('op'); // يمنع حفظ النافذة نفسها مرتين
   const p = id ? state.visa.purchases.find((x) => x.id === id) : null;
   const sd = state.settings.visaStatementDay;
   openSheet(`${head(p ? 'تعديل شراء' : 'شراء بالفيزا')}
@@ -1000,13 +1051,16 @@ function visaBuySheet(id) {
     sh.querySelector('[name="date"]').addEventListener('change', upd); upd();
     on(sh, '[data-a="save"]', () => {
       const data = { amount: money(v(sh, 'amount')), date: v(sh, 'date'), note: v(sh, 'note') };
-      if (commit((s) => (p ? A.updateVisaPurchase(s, p.id, data) : A.addVisaPurchase(s, data)), 'تم الحفظ')) closeSheet();
+      const done = p ? commit((s) => A.updateVisaPurchase(s, p.id, data), 'تم الحفظ')
+        : guarded({ ...data, opId }, (d) => A.addVisaPurchase(state, d, today), () => `توجد عملية شراء مطابقة (${fmtKD(data.amount)} د.ك، ${E.dateLabel(data.date)}). هل هي عملية مستقلة فعلًا؟`, 'تم الحفظ');
+      if (done) closeSheet();
     });
     on(sh, '[data-a="del"]', () => { if (confirm('حذف عملية الشراء؟') && commit((s) => A.deleteVisaPurchase(s, p.id), 'تم الحذف')) closeSheet(); });
   });
 }
 
 function visaPaySheet() {
+  const opId = E.uid('op'); // يمنع حفظ النافذة نفسها مرتين
   const vs = E.visaSummary(state, today);
   openSheet(`${head('سداد الفيزا', `المستخدم غير المسدد ${fmtKD(vs.used)} د.ك`)}
     <div class="row2">${field('المبلغ', moneyInput('amount', vs.dueUnpaid || ''))}${field('التاريخ', dateInput('date', today))}</div>
@@ -1017,9 +1071,8 @@ function visaPaySheet() {
     on(sh, '[data-fill]', (e, el) => { sh.querySelector('[name="amount"]').value = inputKD(Number(el.dataset.fill)); });
     on(sh, '[data-a="pay"]', () => {
       const amount = money(v(sh, 'amount'));
-      const dupV = A.findDuplicateVisaPayment(state, { amount, date: v(sh, 'date') });
-      if (dupV && !confirm(`يوجد سداد فيزا مطابق (${fmtKD(dupV.amount)} د.ك بتاريخ ${E.dateLabel(dupV.date)}). تسجيله مرة ثانية؟`)) return;
-      if (commit((s) => A.addVisaPayment(s, { amount, date: v(sh, 'date'), cashMonth: v(sh, 'cm') || null }, today), 'تم تسجيل السداد')) closeSheet();
+      const data = { amount, date: v(sh, 'date'), cashMonth: v(sh, 'cm') || null, opId };
+      if (guarded(data, (d) => A.addVisaPayment(state, d, today), () => `يوجد سداد فيزا مطابق (${fmtKD(amount)} د.ك، ${E.dateLabel(data.date)}). هل هو سداد مستقل فعلًا؟`, 'تم تسجيل السداد')) closeSheet();
     });
   });
 }
@@ -1083,7 +1136,7 @@ document.addEventListener('click', (e) => {
     case 'arrears-inline': {
       const inp = document.querySelector(`[data-arr-in="${d.id}"]`);
       const amount = money(inp?.value || '');
-      addPay({ itemId: d.id, month: d.m, kind: 'arrears', amount, date: today }, 'تم السداد من العجز');
+      addPay({ itemId: d.id, month: d.m, kind: 'arrears', amount, date: today, opId: el.dataset.op }, 'تم السداد من العجز');
       break;
     }
     case 'month-close': monthCloseSheet(view.month); break;
@@ -1097,6 +1150,7 @@ document.addEventListener('click', (e) => {
       break;
     }
     case 'cash': cashSheet(); break;
+    case 'reserve': reserveSheet(d.id); break;
     case 'reserve-toggle': {
       const r = (state.reserves || []).find((x) => x.id === d.id);
       if (!r) break;
@@ -1171,7 +1225,18 @@ async function boot() {
   render();
   requestPersistence();
   if ('serviceWorker' in navigator && location.protocol !== 'file:') {
-    navigator.serviceWorker.register('./sw.js').catch(() => {});
+    navigator.serviceWorker.register('./sw.js').then((reg) => {
+      // عند تثبيت نسخة جديدة: أعد التحميل مرة واحدة لتطبيقها (البيانات في IndexedDB لا تتأثر)
+      reg.addEventListener('updatefound', () => {
+        const w = reg.installing;
+        w?.addEventListener('statechange', () => {
+          if (w.state === 'activated' && navigator.serviceWorker.controller && !sessionStorage.getItem('mfp-updated')) {
+            try { sessionStorage.setItem('mfp-updated', '1'); } catch { /* ignore */ }
+            location.reload();
+          }
+        });
+      });
+    }).catch(() => {});
   }
 }
 boot();
