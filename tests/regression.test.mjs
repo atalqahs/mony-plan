@@ -286,3 +286,81 @@ test('الخطة المرجعية تبقى صحيحة بعد الإصلاحات 
   assert.equal(sim.byKey['2027-05'].debtBalancesEnd.p_abuosama, 0);
   assert.equal(sim.allDebtsEndMonth, '2027-05');
 });
+
+/* ═════════ سداد تاريخي (سهيل / شفيق / الكهربائي) ═════════ */
+const NOW = '2026-11-01';
+test('سهيل 550 بتاريخ أغسطس 2026: يُنسب لبداية الخطة، الدين صفر، والسيولة والموعد لا يتغيران — وبعد إعادة التحميل', () => {
+  const st = fresh();
+  ok(A.setCash(st, { amount: KD(1000), date: NOW }, NOW));
+  const cash0 = E.actualCash(st, NOW).amount;
+  const base = E.simulate(st, { today: NOW });
+  const inf = A.inferPlanMonth(st, 'p_suhail', '2026-08-15', NOW);
+  assert.deepEqual([inf.month, inf.sure, inf.before], ['2026-09', true, true], 'لا يُستخدم الشهر الحالي ولا نوفمبر');
+  assert.equal(A.paymentImpact(st, '2026-08-15', NOW).historical, true, 'سداد سابق');
+  ok(A.addPayment(st, { itemId: 'p_suhail', month: inf.month, amount: KD(550), date: '2026-08-15' }, { today: NOW }));
+  const reloaded = E.migrate(JSON.parse(JSON.stringify(st))).state; // حفظ وإعادة فتح
+  for (const s of [st, reloaded]) {
+    assert.equal(E.debtStatus(s, E.itemById(s, 'p_suhail')).remaining, 0);
+    assert.equal(s.payments[0].date, '2026-08-15', 'التاريخ الحقيقي محفوظ');
+    assert.equal(E.actualCash(s, NOW).amount, cash0, 'السيولة الفعلية لم تتغير');
+    const sm = E.simulate(s, { today: NOW });
+    assert.deepEqual(sm.months.filter((m) => m.forecast).map((m) => [m.key, m.cashEnd, m.fundingGap]), base.months.filter((m) => m.forecast).map((m) => [m.key, m.cashEnd, m.fundingGap]));
+    assert.equal(sm.endMonth, base.endMonth, 'لا يؤخر الإغلاق');
+    assert.equal(sm.byKey['2026-11'].actualOut, 0, 'لا يظهر كمدفوع من نوفمبر');
+    assert.equal(sm.byKey['2026-09'].lines.find((l) => l.id === 'p_suhail').paidReg, KD(550));
+    const d = E.dailyLedger(s, sm, NOW);
+    assert.ok(!d.events.some((e) => e.type === 'fact' && e.label.includes('سهيل') && e.date > sm.anchorDate));
+  }
+  same(st, NOW);
+});
+
+test('شفيق 24 والكهربائي 20 سدادًا تاريخيًا: نفس المنطق، والإجمالي ينخفض 594 مع سهيل', () => {
+  const st = fresh();
+  const total0 = E.dashboard(st, E.simulate(st, { today: NOW })).remaining;
+  for (const [id, a, d] of [['p_suhail', 550, '2026-08-15'], ['p_shafiq', 24, '2026-08-20'], ['p_electric', 20, '2026-07-02']]) {
+    const inf = A.inferPlanMonth(st, id, d, NOW);
+    assert.equal(inf.month, '2026-09');
+    ok(A.addPayment(st, { itemId: id, month: inf.month, amount: KD(a), date: d }, { today: NOW }));
+  }
+  const sm = E.simulate(st, { today: NOW });
+  assert.equal(total0 - E.dashboard(st, sm).remaining, KD(594));
+  assert.equal(sm.byKey['2026-11'].cashStart, 0);
+  same(st, NOW);
+});
+
+test('بيانات محفوظة سابقًا: سداد سهيل بتاريخ أغسطس نُسب لنوفمبر ← الترحيل ينسبه لسبتمبر دون فقد', () => {
+  const st = fresh();
+  ok(A.addPayment(st, { itemId: 'p_suhail', month: '2026-11', amount: KD(550), date: '2026-08-15' }, { today: NOW }));
+  const old = JSON.parse(JSON.stringify(st)); old.schema = 4;
+  const { state: m } = E.migrate(old);
+  assert.equal(m.payments.length, 1);
+  assert.deepEqual([m.payments[0].id, m.payments[0].amount, m.payments[0].date, m.payments[0].month], [st.payments[0].id, KD(550), '2026-08-15', '2026-09']);
+  assert.equal(E.simulate(m, { today: NOW }).byKey['2026-11'].actualOut, 0);
+  assert.ok(m.log[m.log.length - 1].text.includes('سهيل'));
+});
+
+test('دفعة حالية بعد تاريخ الرصيد تُخصم من السيولة، ودفعة قبل تاريخ الرصيد داخل الفترة لا تُخصم مرة ثانية', () => {
+  const st = fresh();
+  ok(A.setCash(st, { amount: KD(1000), date: '2026-11-03' }, '2026-11-05'));
+  assert.equal(A.paymentImpact(st, '2026-11-04', '2026-11-05').historical, false);
+  ok(A.addPayment(st, { itemId: 'furniture', month: '2026-11', amount: KD(460), date: '2026-11-04' }, { today: '2026-11-05' }));
+  assert.equal(E.actualCash(st, '2026-11-05').amount, KD(540), 'سداد حالي خُصم مرة واحدة');
+  assert.equal(A.paymentImpact(st, '2026-11-02', '2026-11-05').historical, true, 'داخل الفترة لكن قبل تاريخ الرصيد: مُضمَّن فيه');
+  ok(A.addPayment(st, { itemId: 'small', month: '2026-11', amount: KD(170), date: '2026-11-02' }, { today: '2026-11-05' }));
+  assert.equal(E.actualCash(st, '2026-11-05').amount, KD(540));
+  assert.equal(E.actualCash(fresh(), NOW), null, 'بلا رصيد مُدخل: لا يُعرض صفر كحقيقة');
+  same(st, '2026-11-05');
+});
+
+test('استنتاج شهر الخطة: يسأل عند الالتباس فقط', () => {
+  const st = fresh();
+  assert.deepEqual(A.inferPlanMonth(st, 'furniture', '2026-11-25', NOW).month, '2026-11');
+  const amb = A.inferPlanMonth(st, 'furniture', '2026-12-05', NOW);
+  assert.equal(amb.sure, false, 'أثاث نوفمبر وديسمبر كلاهما غير مسدد');
+  assert.deepEqual(amb.candidates, ['2026-11', '2026-12']);
+  ok(A.addPayment(st, { itemId: 'furniture', month: '2026-11', amount: KD(460), date: '2026-11-25' }, { today: '2026-11-25' }));
+  const now = A.inferPlanMonth(st, 'furniture', '2026-12-05', '2026-12-05');
+  assert.deepEqual([now.month, now.sure], ['2026-12', true], 'بعد سداد نوفمبر لا التباس');
+  assert.equal(A.inferPlanMonth(st, 'p_abuosama', '2026-12-05', NOW).month, '2026-12', 'لا مبلغ مخطط في أي منهما');
+  assert.equal(A.inferPlanMonth(st, 'furniture', '2026-02-30', NOW).month, null);
+});

@@ -568,3 +568,35 @@ export function findDuplicatePayment(state, { itemId, month, kind = 'regular', a
 export function findDuplicateVisaPayment(state, { amount, date }) {
   return state.visa.payments.find((p) => p.amount === amount && p.date === date) || null;
 }
+
+/* ── استنتاج شهر الخطة وأثر الدفعة (لنافذة السداد السريع) ── */
+
+/**
+ * يستنتج شهر الخطة من تاريخ الدفعة دون تخمين:
+ * - قبل بداية الخطة ← شهر بداية الخطة (سداد سابق).
+ * - التاريخ داخل نافذة شهره التقويمي (من يوم الراتب) ← ذلك الشهر.
+ * - بين أول الشهر ويوم الراتب يقع بين خطتين (السابقة والحالية): إن كان للبند مبلغ غير مسدد في واحدة فقط
+ *   فهي، وإن لم يكن له مبلغ في أي منهما فالشهر التقويمي، وإن كان في الاثنتين ← sure=false ويُسأل المستخدم.
+ */
+export function inferPlanMonth(state, itemId, date, today = kuwaitToday()) {
+  const start = state.settings.planStart;
+  if (!okDate(date)) return { month: null, sure: false, candidates: [] };
+  if (date < `${start}-01`) return { month: start, sure: true, candidates: [start], before: true };
+  const cal = monthOfDate(date);
+  const win = Number(date.slice(8, 10)) >= state.settings.salaryDay ? cal : addMonths(cal, -1);
+  if (win === cal || win < start) return { month: cal, sure: true, candidates: [cal] };
+  const sim = simulate(state, { today, until: cal });
+  const open = (m) => { const l = sim.byKey[m]?.lines.find((x) => x.id === itemId); return l ? Math.max(0, l.planned - l.paidReg) : 0; };
+  const a = open(win); const b = open(cal);
+  if (a > 0 && b === 0) return { month: win, sure: true, candidates: [win, cal] };
+  if (b > 0 && a === 0) return { month: cal, sure: true, candidates: [win, cal] };
+  if (a === 0 && b === 0) return { month: cal, sure: true, candidates: [win, cal] };
+  return { month: null, sure: false, candidates: [win, cal] };
+}
+
+/** أثر الدفعة على السيولة: سابقة (قبل/عند تاريخ الرصيد الافتتاحي أو بلا تاريخ) لا تُخصم من السيولة الحالية */
+export function paymentImpact(state, date, today = kuwaitToday()) {
+  const sim = simulate(state, { today, until: forecastStartOf(state, today) });
+  if (!date) return { historical: true, anchorDate: sim.anchorDate };
+  return { historical: date <= sim.anchorDate, anchorDate: sim.anchorDate };
+}

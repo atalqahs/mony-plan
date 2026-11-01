@@ -9,7 +9,7 @@
 // 4) العجز ليس دينًا إضافيًا: هو جزء من الرصيد الحقيقي، ويُسقف به.
 import { parseKD } from './money.js';
 
-export const SCHEMA = 4;
+export const SCHEMA = 5;
 export const DEFAULT_PRIORITY = ['violations', 'furniture', 'p_suhail', 'p_shafiq', 'p_electric', 'p_abuosama'];
 const SEEDED_PERSONS = ['p_suhail', 'p_shafiq', 'p_electric', 'p_abuosama'];
 const MAX_MONTHS = 600;
@@ -798,7 +798,51 @@ export function migrate(input) {
     state.log.push({ ts: now, text: `تحديث نموذج البيانات إلى الإصدار 4 دون حذف أي بيانات${notes.length ? ` (${notes.join('، ')})` : ''}.` });
     changed = true;
   }
+  if ((state.schema || 4) < 5) {
+    // دفعات مؤرخة قبل بداية الخطة نُسبت خطأً لشهر لاحق (كانت النافذة تفترض الشهر المعروض):
+    // تُنسب لشهر بداية الخطة. المبلغ والتاريخ والمعرّف لا تتغير، ولا أثر نقدي لها أصلًا.
+    const startDay = `${state.settings.planStart}-01`;
+    const moved = [];
+    for (const p of state.payments) {
+      if (p.date && p.date < startDay && p.month > state.settings.planStart) {
+        moved.push(`${state.items.find((i) => i.id === p.itemId)?.name || p.itemId} ${p.date}: ${monthLabel(p.month)} ← ${monthLabel(state.settings.planStart)}`);
+        p.month = state.settings.planStart;
+      }
+    }
+    state.schema = 5;
+    state.log.push({ ts: now, text: `تحديث نموذج البيانات إلى الإصدار 5${moved.length ? ` — تصحيح نسبة دفعات سابقة لبداية الخطة: ${moved.join('؛ ')}` : ''}.` });
+    changed = true;
+  }
   return { state, changed };
+}
+
+/* ───────────── النقد الفعلي الآن ───────────── */
+
+/**
+ * السيولة الفعلية حتى اليوم: الرصيد المُدخل + الدخل المستلم المؤكد بعد تاريخه − الدفعات المؤكدة بعده
+ * (ما غطّاه احتياطي محجوز لا يُخصم مرة ثانية) − سداد الفيزا من السيولة − الاحتياطيات المحجوزة.
+ * null إن لم يُدخل المستخدم رصيدًا (لا يُعرض صفر كأنه حقيقة).
+ */
+export function actualCash(state, today = kuwaitToday()) {
+  const c = state.settings.cash || {};
+  if (!c.date) return null;
+  const after = (d) => !!d && d > c.date && d <= today;
+  let cash = c.amount || 0;
+  for (let i = monthIndex(state.settings.planStart) - 1; i <= monthIndex(monthOfDate(today)) + 1; i++) {
+    const mk = monthKey(i);
+    for (const inc of [salaryFor(state, mk), rentFor(state, mk)]) if (inc.received && after(inc.receivedDate)) cash += inc.receivedAmount;
+  }
+  for (const e of state.extras) if (e.status === 'received' && after(e.date)) cash += e.amount;
+  const pot = {};
+  for (const r of state.reserves || []) if (r.heldDate && r.heldDate <= today) { pot[r.id] = r.amount; if (after(r.heldDate)) cash -= r.amount; }
+  const pays = confirmedPayments(state).filter((p) => p.date && p.date <= today).sort((a, b) => (a.date < b.date ? -1 : 1));
+  for (const p of pays) {
+    let covered = 0;
+    for (const r of state.reserves || []) if (pot[r.id] && r.targetItem === p.itemId && r.targetMonth === p.month) { const x = Math.min(pot[r.id], p.amount - covered); pot[r.id] -= x; covered += x; }
+    if (after(p.date)) cash -= p.amount - covered;
+  }
+  for (const p of state.visa.payments) if (p.cashMonth && after(p.date)) cash -= p.amount;
+  return { amount: cash, since: c.date };
 }
 
 /* ───────────── تمويل الاحتياطي: المصدر والتوقيت ───────────── */
