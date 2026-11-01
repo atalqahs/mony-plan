@@ -37,6 +37,12 @@ export function addPayment(state, { itemId, month, kind = 'regular', amount, dat
       }
     }
   }
+  if (item.type === 'expense' && kind === 'regular') {
+    const sim = simulate(state, { today: opts.today, until: month });
+    const l = sim.byKey[month]?.lines.find((x) => x.id === itemId);
+    const planLeft = l ? Math.max(0, l.planned - l.paidReg - l.pendingReg) : 0;
+    if (amount > planLeft && !note.trim()) return `المبلغ أكبر من المتبقي من المخطط (${fmtKD(planLeft)} د.ك). اكتب سبب الزيادة في الملاحظة.`;
+  }
   if (kind === 'arrears') {
     const sim = simulate(state, { today: opts.today, until: month });
     const line = sim.byKey[month]?.lines.find((l) => l.id === itemId);
@@ -135,14 +141,22 @@ export function setIncome(state, month, kind, patch) {
   if (kind !== 'salary' && kind !== 'rent') return 'نوع الدخل غير صالح';
   if (patch.amount !== undefined && (!Number.isSafeInteger(patch.amount) || patch.amount < 0)) return 'المبلغ غير صالح';
   if (patch.date !== undefined && patch.date !== null && !okDate(patch.date)) return 'التاريخ غير صالح';
+  if (patch.receivedAmount !== undefined && patch.receivedAmount !== null && (!Number.isSafeInteger(patch.receivedAmount) || patch.receivedAmount < 0)) return 'المبلغ المستلم غير صالح';
+  if (patch.receivedDate && !okDate(patch.receivedDate)) return 'تاريخ الاستلام غير صالح';
+  if (patch.allocMonth !== undefined) {
+    if (kind !== 'rent') return 'التخصيص متاح لبدل الإيجار فقط';
+    if (patch.allocMonth !== null && !okMonth(patch.allocMonth)) return 'شهر التخصيص غير صالح';
+  }
   const md = monthData(state, month);
   md[kind] = { ...(md[kind] || {}), ...patch };
-  if (patch.received === false) md[kind].receivedDate = null;
+  if (patch.received === false) { md[kind].receivedDate = null; md[kind].receivedAmount = null; }
+  if (patch.allocMonth === null || patch.allocMonth === month) delete md[kind].allocMonth;
   const label = kind === 'salary' ? 'الراتب' : 'بدل الإيجار';
   const parts = [];
   if (patch.amount !== undefined) parts.push(`المبلغ ${fmtKD(patch.amount)}`);
   if (patch.date) parts.push(`الموعد ${dateLabel(patch.date)}`);
-  if (patch.received === true) parts.push(`تأكيد الاستلام ${dateLabel(patch.receivedDate)}`);
+  if (patch.received === true) parts.push(`تأكيد الاستلام ${patch.receivedAmount !== undefined && patch.receivedAmount !== null ? `${fmtKD(patch.receivedAmount)} ` : ''}${dateLabel(patch.receivedDate)}`);
+  if (patch.allocMonth) parts.push(`مخصص لخطة ${monthLabel(patch.allocMonth)}`);
   if (patch.received === false) parts.push('إلغاء تأكيد الاستلام');
   log(state, `${label} — ${monthLabel(month)}: ${parts.join('، ')}`);
   return null;
@@ -188,6 +202,7 @@ export function addItem(state, data) {
       id: uid('d'), type: 'debt', group: data.group || 'loan', name, icon: data.icon || (data.group === 'person' ? '👤' : '🏦'),
       opening: data.opening, mandatory: data.mandatory || 0, extra: data.extra || 'allow',
       start: data.start || state.settings.planStart, order, closedConfirmed: false, createdAt: nowIso(),
+      ...(data.group === 'person' ? { verified: data.verified !== false } : {}),
     };
     state.items.push(it);
     if (it.extra === 'allow') state.settings.payoffPriority = [...(state.settings.payoffPriority || []), it.id];
@@ -279,6 +294,8 @@ export function confirmClose(state, itemId, value = true) {
 export function addVisaPurchase(state, { date, amount, note = '' }) {
   if (!okDate(date)) return 'التاريخ غير صالح';
   if (!okAmount(amount)) return 'أدخل مبلغًا أكبر من صفر';
+  const vs = visaSummary(state);
+  if (amount > vs.available) return `المبلغ يتجاوز الحد المتاح (${fmtKD(Math.max(0, vs.available))} د.ك)`;
   const p = { id: uid('vp'), date, amount, note, createdAt: nowIso() };
   state.visa.purchases.push(p);
   log(state, `فيزا — شراء ${fmtKD(amount)} د.ك بتاريخ ${dateLabel(date)} (كشف ${dateLabel(visaCycleEnd(date, state.settings.visaStatementDay))})${note ? ` — ${note}` : ''}`);
@@ -289,6 +306,10 @@ export function updateVisaPurchase(state, id, patch) {
   if (!p) return 'غير موجود';
   if (patch.date !== undefined && !okDate(patch.date)) return 'التاريخ غير صالح';
   if (patch.amount !== undefined && !okAmount(patch.amount)) return 'أدخل مبلغًا أكبر من صفر';
+  if (patch.amount !== undefined) {
+    const vs = visaSummary(state);
+    if (patch.amount - p.amount > vs.available) return `التعديل يتجاوز الحد المتاح (${fmtKD(Math.max(0, vs.available))} د.ك)`;
+  }
   const before = `${fmtKD(p.amount)} / ${p.date}`;
   Object.assign(p, patch, { editedAt: nowIso() });
   log(state, `فيزا — تعديل شراء: ${before} ← ${fmtKD(p.amount)} / ${p.date}`);
@@ -377,12 +398,54 @@ export function resetPayoffPriority(state) {
   return setPayoffPriority(state, [...DEFAULT_PRIORITY.filter((id) => ids.has(id)), ...rest]);
 }
 
-/** تاريخ إقفال شهر مالي (null = تلقائي) */
-export function setMonthClose(state, month, date) {
+/** إقفال الشهر يدويًا أو إعادة فتحه. عند الإقفال يصبح غير المسدد من خطة الشهر عجزًا مؤكدًا. */
+export function closeMonth(state, month, closed = true, date = kuwaitToday()) {
   if (!okMonth(month)) return 'الشهر غير صالح';
-  if (date !== null && !okDate(date)) return 'التاريخ غير صالح';
   if (!state.months[month]) state.months[month] = { plan: {} };
-  if (date === null) delete state.months[month].closeDate; else state.months[month].closeDate = date;
-  log(state, `إقفال ${monthLabel(month)}: ${date ? `من ${dateLabel(date)}` : 'تلقائي'}`);
+  const md = state.months[month];
+  if (closed) { md.closed = true; md.closedAt = date; } else { md.closed = false; delete md.closedAt; }
+  log(state, `${closed ? 'إقفال' : 'إعادة فتح'} ${monthLabel(month)}`);
+  return null;
+}
+
+/** الرصيد النقدي المتاح فعليًا (دون المبالغ المحجوزة) بتاريخ محدد. افتراضيًا صفر. */
+export function setCash(state, { amount, date, note = '' }, today = kuwaitToday()) {
+  if (!Number.isSafeInteger(amount) || amount < 0) return 'أدخل رصيدًا صالحًا (صفر أو أكثر)';
+  if (!okDate(date)) return 'التاريخ غير صالح';
+  if (date > today) return 'تاريخ الرصيد لا يمكن أن يكون في المستقبل';
+  const old = state.settings.cash || {};
+  state.settings.cash = { amount, date, note };
+  log(state, `الرصيد النقدي المتاح: ${old.date ? `${fmtKD(old.amount)} (${dateLabel(old.date)})` : 'غير مُدخل'} ← ${fmtKD(amount)} د.ك بتاريخ ${dateLabel(date)}${note ? ` — ${note}` : ''}`);
+  return null;
+}
+
+/** تأكيد حجز احتياطي (date) أو إلغاؤه (null) */
+export function holdReserve(state, id, date) {
+  const r = (state.reserves || []).find((x) => x.id === id);
+  if (!r) return 'الاحتياطي غير موجود';
+  if (date !== null && !okDate(date)) return 'التاريخ غير صالح';
+  r.heldDate = date;
+  log(state, `${r.name}: ${date ? `تأكيد حجز ${fmtKD(r.amount)} د.ك بتاريخ ${dateLabel(date)}` : 'إلغاء تأكيد الحجز'}`);
+  return null;
+}
+export function updateReserve(state, id, patch) {
+  const r = (state.reserves || []).find((x) => x.id === id);
+  if (!r) return 'الاحتياطي غير موجود';
+  if (patch.amount !== undefined && (!Number.isSafeInteger(patch.amount) || patch.amount < 0)) return 'المبلغ غير صالح';
+  if (patch.month !== undefined && !okMonth(patch.month)) return 'الشهر غير صالح';
+  if (patch.targetMonth !== undefined && !okMonth(patch.targetMonth)) return 'الشهر غير صالح';
+  const next = { ...r, ...patch };
+  if (next.targetMonth < next.month) return 'شهر الاستخدام قبل شهر الحجز';
+  Object.assign(r, patch);
+  log(state, `تعديل ${r.name}: ${fmtKD(r.amount)} د.ك، حجز ${monthLabel(r.month)}، استخدام ${monthLabel(r.targetMonth)}`);
+  return null;
+}
+
+/** دين شخص: تأكيد أنه مستحق فعلًا (يدخل الجدولة) أو إبقاؤه بانتظار التحقق */
+export function setVerified(state, id, value) {
+  const d = itemById(state, id);
+  if (!d || d.type !== 'debt') return 'الدين غير موجود';
+  d.verified = !!value;
+  log(state, `${d.name}: ${value ? 'مستحق فعلًا — يدخل الجدولة' : 'بانتظار التحقق — خارج الجدولة'}`);
   return null;
 }
