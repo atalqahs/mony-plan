@@ -25,6 +25,7 @@ function checkSvg(status, frac = 0, active = false) {
     const f = Math.max(0.06, Math.min(0.94, frac));
     return `<svg viewBox="0 0 32 32"><circle cx="16" cy="16" r="14" fill="none" stroke="${ring}" stroke-width="2"/><circle cx="16" cy="16" r="14" fill="none" stroke="#fff" stroke-width="2.8" stroke-linecap="round" stroke-dasharray="${(c * f).toFixed(2)} ${c.toFixed(2)}" transform="rotate(-90 16 16)"/></svg>`;
   }
+  if (status === 'recorded') return '<svg viewBox="0 0 32 32"><circle cx="16" cy="16" r="14" fill="none" stroke="#fff" stroke-width="2" stroke-dasharray="3.2 3.2"/></svg>';
   return `<svg viewBox="0 0 32 32"><circle cx="16" cy="16" r="14.5" fill="none" stroke="${ring}" stroke-width="2"/></svg>`;
 }
 
@@ -56,8 +57,9 @@ function commit(fn, okMsg) {
   return true;
 }
 
-const curBudgetMonth = () => E.budgetMonthOf(today, state.settings.salaryDay);
-const defaultDateFor = (month) => (E.budgetMonthOf(today, state.settings.salaryDay) === month ? today : E.dateIn(month, state.settings.salaryDay));
+// الشهر المالي المعروض مستقل عن تاريخ الدفعة: تاريخ الدفعة الافتراضي هو اليوم، ويمكن تغييره
+const curBudgetMonth = () => today.slice(0, 7);
+const defaultDateFor = () => today;
 function monthOptions(selected, { allowEmpty = false, emptyLabel = 'بدون' } = {}) {
   const start = E.monthIndex(state.settings.planStart);
   const endKey = [sim?.endMonth || state.settings.planStart, today.slice(0, 7), selected || state.settings.planStart].sort().pop();
@@ -77,6 +79,7 @@ function render() {
   const winEnd = gridWindow()[5];
   sim = E.simulate(state, { today, until: [view.month, winEnd].sort().pop() });
   const dash = E.dashboard(state, sim);
+  const rel = E.planReliability(state, sim, today);
   const vs = E.visaSummary(state, today);
   const m = sim.byKey[view.month];
   void winStart;
@@ -90,7 +93,7 @@ function render() {
       </div>
     </header>
     ${visaBanner(vs)}
-    ${dashboardCard(dash)}
+    ${dashboardCard(dash, rel)}
     <div class="subhead">
       <h2>${E.monthLabel(view.month)}</h2>
       <div class="nav">
@@ -122,9 +125,9 @@ function gridWindow() {
 }
 
 /* ── لوحة المعلومات ── */
-function dashboardCard(d) {
-  const t = percentTenths(d.paid, d.original);
-  const thisMonth = state.payments.filter((p) => p.month === curBudgetMonth() && E.itemById(state, p.itemId)?.type === 'debt').reduce((a, p) => a + p.amount, 0);
+function dashboardCard(d, rel) {
+  const t = percentTenths(d.reduced, d.original);
+  const thisMonth = E.confirmedPayments(state).filter((p) => p.date && p.date.slice(0, 7) === today.slice(0, 7) && E.itemById(state, p.itemId)?.type === 'debt').reduce((a, p) => a + p.amount, 0);
   let deltaTxt = '—'; let deltaCls = 'muted';
   if (d.deltaMonths !== null) {
     const n = Math.abs(d.deltaMonths);
@@ -137,7 +140,7 @@ function dashboardCard(d) {
   return `
   <section class="card" aria-label="لوحة الديون">
     <div class="card-head">
-      <h2 class="card-title">الديون المتبقية</h2>
+      <h2 class="card-title">الديون المتبقية الفعلية</h2>
       <button class="pill" data-act="quick-pay">${ICON.plus} تسجيل دفعة</button>
     </div>
     <div class="big">
@@ -145,14 +148,17 @@ function dashboardCard(d) {
       <div class="side ${thisMonth > 0 ? 'green' : 'muted'}">↓ ${kd(thisMonth)} هذا الشهر</div>
     </div>
     <div class="bar" role="progressbar" aria-valuenow="${Math.floor(t / 10)}" aria-valuemin="0" aria-valuemax="100"><i style="width:${t / 10}%"></i></div>
-    <div class="bar-legend"><span>الأصلي <b class="num">${fmtKD(d.original)}</b></span><b class="num">${pct(t)}</b><span>المسدد <b class="num">${fmtKD(d.paid)}</b></span></div>
+    <div class="bar-legend"><span>الابتدائي <b class="num">${fmtKD(d.initial)}</b></span><b class="num">${pct(t)}</b><span>المسدد المؤكد <b class="num">${fmtKD(d.paid)}</b></span></div>
+    ${d.original !== d.initial ? `<div class="note">الإجمالي بعد تصحيحات الأرصدة: ${kd(d.original)} د.ك</div>` : ''}
     <div class="divider"></div>
     <div class="stats">
-      <div><div class="l">الانتهاء المتوقع</div><div class="v">${d.endMonth ? E.monthLabel(d.endMonth) : 'غير محدد'}</div>${left !== null && left >= 0 ? `<div class="s">بعد ${left} ${left === 1 ? 'شهر' : 'أشهر'}</div>` : ''}</div>
+      <div><div class="l">الإغلاق المتوقع</div><div class="v">${d.endMonth ? E.monthLabel(d.endMonth) : 'غير محدد'}</div>${left !== null && left >= 0 ? `<div class="s">بعد ${left} ${left === 1 ? 'شهر' : 'أشهر'}</div>` : ''}</div>
       <div><div class="l">الموعد الأصلي</div><div class="v">${d.baselineEnd ? E.monthLabel(d.baselineEnd) : '—'}</div></div>
       <div><div class="l">الفرق</div><div class="v ${deltaCls}">${deltaTxt}</div></div>
     </div>
-    ${!d.endMonth ? '<div class="alert">السيولة الحالية لا تكفي لتصفية الديون خلال 50 سنة. راجع الدخل والمصاريف.</div>' : ''}
+    ${!d.endMonth ? '<div class="alert">لا يمكن تحديد موعد إغلاق موثوق: السيولة المتوقعة لا تكفي لتصفية الديون. راجع الدخل والمصاريف.</div>' : ''}
+    ${rel.gaps.length ? `<div class="alert">الموعد غير مضمون: السيولة المتوقعة لا تكفي الالتزامات في ${rel.gaps.slice(0, 3).map((g) => E.monthLabel(g.key)).join('، ')}${rel.gaps.length > 3 ? ` و${rel.gaps.length - 3} أشهر أخرى` : ''}.</div>` : ''}
+    <div class="note">الموعد <b>توقع</b> مبني على الأرصدة الافتتاحية والدفعات المؤكدة فقط، مع افتراض وصول الراتب وبدل الإيجار الأساسيين في الأشهر القادمة (${rel.futureIncomeUnconfirmed} شهرًا غير مؤكد الدخل). الدخل غير المؤكد والسيناريوهات لا تدخل فيه.${rel.unconfirmedPast.length ? ` يوجد ${rel.unconfirmedPast.length} التزامًا في أشهر مقفلة دون دفعة مؤكدة، يُحتسب عجزًا حتى تؤكده.` : ''}${d.inferred ? ` يشمل الإجمالي ${kd(d.inferred)} د.ك رصيدًا مستنتجًا غير مؤكد (${rel.inferred.map((x) => esc(x.name)).join('، ')}).` : ''}</div>
   </section>`;
 }
 
@@ -186,11 +192,12 @@ function gridCard() {
       return `<button class="chk" data-act="cell" data-m="${k}" data-id="${it.id}" aria-label="${esc(it.name)} ${E.monthLabel(k)}">${checkSvg(l.status, frac, k === view.month)}</button>`;
     }).join('');
     const st = streak(it.id);
-    return `<div class="g-row g-item"><div class="g-name row-tap" data-act="item" data-id="${it.id}"><span class="ic">${it.icon || '•'}</span><span class="t">${esc(shortName(it.name))}</span><span class="streak ${st ? '' : 'zero'}">🔥<span class="num">${st}</span></span></div>${cells}</div>`;
+    return `<div class="g-row g-item"><div class="g-name row-tap" data-act="item" data-id="${it.id}"><span class="ic">${it.icon || '•'}</span><span class="t">${esc(shortName(it))}</span>${st ? `<span class="streak">🔥<span class="num">${st}</span></span>` : ''}</div>${cells}</div>`;
   }).join('');
   return `<section class="card grid" aria-label="جدول الأشهر"><div class="g-row g-head"><span></span>${head}</div>${rows || '<div class="empty">لا توجد التزامات في هذه الفترة.</div>'}</section>`;
 }
-const shortName = (n) => n.replace(/^قرض\s+/, '');
+const SHORT = { personal: 'المصروف', uni: 'الجامعة' };
+const shortName = (it) => it.short || SHORT[it.id] || it.name.replace(/^قرض\s+/, '');
 function streak(id) {
   let n = 0;
   for (let i = sim.months.findIndex((m) => m.key === view.month); i >= 0; i--) {
@@ -211,6 +218,8 @@ function obligationsCard(m) {
     if (l.type === 'debt' && l.mandatory > 0) subs.push(`القسط الإلزامي ${kd(l.mandatory)}`);
     if (due) subs.push(`الاستحقاق ${E.dateLabel(due)}`);
     const tag = l.engineManaged ? '<span class="tag">جدولة تلقائية</span>' : l.stored !== null && l.type === 'expense' ? '<span class="tag">معدّل</span>' : '';
+    if (l.item.openingInferred) subs.push('<span class="amber">رصيد مستنتج غير مؤكد</span>');
+    if (l.pendingReg > 0) subs.push(`مسجلة بانتظار التأكيد ${kd(l.pendingReg)}`);
     const frac = l.planned > 0 ? l.paidReg / l.planned : 0;
     return `<div class="li">
       <div class="ic">${l.icon || '•'}</div>
@@ -224,9 +233,9 @@ function obligationsCard(m) {
       <button class="chk" data-act="cell" data-m="${view.month}" data-id="${l.id}" aria-label="تأكيد ${esc(l.name)}">${checkSvg(l.status, frac, true)}</button>
     </div>`;
   }).join('');
-  const closeDate = E.dateIn(E.addMonths(view.month, 1), state.settings.salaryDay);
+  const closeDate = E.monthCloseDate(state, view.month);
   return `<section class="card">
-    <div class="card-head"><h2 class="card-title">الالتزامات الشهرية</h2><span class="muted" style="font-size:13px">${m.closed ? 'الشهر مغلق' : `مفتوح حتى ${E.dateLabel(E.addDays(closeDate, -1))}`}</span></div>
+    <div class="card-head"><h2 class="card-title">الالتزامات الشهرية</h2><button class="pill" style="font-size:13px" data-act="month-close">${m.closed ? `مقفل منذ ${E.dateLabel(closeDate)}` : `مفتوح حتى ${E.dateLabel(E.addDays(closeDate, -1))}`}</button></div>
     <div class="list">${rows || '<div class="empty">لا توجد التزامات هذا الشهر.</div>'}</div>
     ${md.notes ? `<div class="note">${esc(md.notes)}</div>` : ''}
   </section>`;
@@ -236,12 +245,14 @@ function obligationsCard(m) {
 function arrearsCard(m) {
   const lines = m.lines.filter((l) => l.arrStart > 0);
   if (!lines.length) return '';
-  const rows = lines.map((l) => `<div class="li">
-      <div class="ic">${l.icon || '•'}</div>
-      <div class="main"><div class="name">${esc(l.name)}</div>${l.paidArr > 0 ? `<div class="sub">سُدد من العجز ${kd(l.paidArr)} د.ك</div>` : ''}</div>
-      <div class="amt"><div class="a num ${l.arrRemaining > 0 ? '' : 'green'}">${fmtKD(l.arrRemaining)}</div></div>
-      ${l.arrRemaining > 0 ? `<button class="pill" data-act="arrears-pay" data-m="${view.month}" data-id="${l.id}">سداد</button>` : `<button class="pill" data-act="cell-detail" data-m="${view.month}" data-id="${l.id}">السجل</button>`}
+  // مربع العجز: اسم البند + العجز المتبقي + إدخال مبلغ السداد فقط (القسط الأساسي منفصل في القائمة أعلاه)
+  const rows = lines.filter((l) => l.arrRemaining > 0).map((l) => `<div class="li arr-row">
+      <div class="main"><div class="name">${l.icon || ''} ${esc(l.name)}</div></div>
+      <div class="amt"><div class="a num">${fmtKD(l.arrRemaining)}</div><div class="b">العجز المتبقي</div></div>
+      <input class="input money arr-in" inputmode="decimal" placeholder="0.000" aria-label="مبلغ السداد من عجز ${esc(l.name)}" data-arr-in="${l.id}">
+      <button class="pill white" data-act="arrears-inline" data-m="${view.month}" data-id="${l.id}">سداد</button>
     </div>`).join('');
+  if (!rows) return '';
   const total = lines.reduce((a, l) => a + l.arrRemaining, 0);
   return `<section class="card" aria-label="العجز">
     <div class="card-head"><h2 class="card-title">العجز</h2><span class="num" style="font-weight:700">${fmtKD(total)} د.ك</span></div>
@@ -320,7 +331,7 @@ function personsCard() {
     else right = `<button class="pill" data-act="debt-pay" data-id="${d.id}">سداد</button>`;
     return `<div class="li">
       <div class="ic">${d.icon || '👤'}</div>
-      <div class="main row-tap" data-act="item" data-id="${d.id}"><div class="name">${esc(d.name)}</div><div class="sub">مسدد ${kd(st.paid)} من ${kd(st.original)}</div></div>
+      <div class="main row-tap" data-act="item" data-id="${d.id}"><div class="name">${esc(d.name)}</div><div class="sub">مسدد ${kd(st.paid)} من ${kd(st.original)}${st.pending ? `، بانتظار التأكيد ${kd(st.pending)}` : ''}</div></div>
       <div class="amt row-tap" data-act="item" data-id="${d.id}"><div class="a num">${fmtKD(st.remaining)}</div><div class="b">متبقٍ</div></div>
       ${right}
     </div>`;
@@ -460,14 +471,16 @@ function cellSheet(month, id, focusPay = true) {
       ${field('المبلغ (د.ك)', moneyInput('amount', remainingPlan || ''))}
       ${field('تاريخ الدفع', dateInput('date', defaultDateFor(month)))}
     </div>
-    ${field('ملاحظة', '<input class="input" name="note" placeholder="اختياري">')}
+    ${field('ملاحظة', '<input class="input" name="note" placeholder="اختياري، مثل: من بدل الإيجار">')}
+    <div class="toggle"><span>تم السداد فعلًا (دفعة مؤكدة)</span><button class="switch on" data-name="confirmed" role="switch" aria-checked="true"></button></div>
+    <div class="note">تُنسب الدفعة إلى خطة ${E.monthLabel(month)} مهما كان تاريخ تنفيذها. الدفعة غير المؤكدة تُحفظ ولا تُخصم من الرصيد حتى تأكيدها.</div>
     ${remainingPlan > 0 ? `<div class="note">دفع مبلغ أقل من ${kd(remainingPlan)} د.ك يُسجّل كدفعة جزئية${l?.carry ? '، والفرق يُرحّل كعجز للشهر التالي' : ''}.</div>` : ''}
     <button class="btn" data-a="pay">تأكيد الدفع</button>
 
     ${pays.length ? `<div class="section-t">الدفعات المسجلة</div><div class="list">${pays.map((p) => `
-      <div class="li"><div class="main"><div class="name num" style="text-align:start">${fmtKD(p.amount)} د.ك</div><div class="sub">${p.kind === 'arrears' ? 'من العجز — ' : ''}${E.dateLabel(p.date)}${p.note ? ` — ${esc(p.note)}` : ''}</div></div>
-      <button class="pill" data-a="edit-pay" data-id="${p.id}">تعديل</button><button class="pill danger" data-a="del-pay" data-id="${p.id}">حذف</button></div>`).join('')}</div>` : ''}
-    ${l && l.paidReg > 0 ? '<button class="btn danger" data-a="uncheck">إزالة علامة الصح</button>' : ''}
+      <div class="li"><div class="main"><div class="name num" style="text-align:start">${fmtKD(p.amount)} د.ك</div><div class="sub">${p.confirmed === false ? '<span class="amber">بانتظار التأكيد</span> — ' : ''}${p.kind === 'arrears' ? 'من العجز — ' : ''}${E.dateLabel(p.date)}${p.note ? ` — ${esc(p.note)}` : ''}</div></div>
+      ${p.confirmed === false ? `<button class="pill white" data-a="confirm-pay" data-id="${p.id}">تأكيد</button>` : ''}<button class="pill" data-a="edit-pay" data-id="${p.id}">تعديل</button><button class="pill danger" data-a="del-pay" data-id="${p.id}">حذف</button></div>`).join('')}</div>` : ''}
+    ${l && (l.paidReg > 0 || l.pendingReg > 0) ? '<button class="btn danger" data-a="uncheck">إزالة علامة الصح</button>' : ''}
 
     <div class="section-t">تعديل الخطة لهذا الشهر فقط</div>
     <div class="row2">
@@ -480,13 +493,15 @@ function cellSheet(month, id, focusPay = true) {
   openSheet(html, (sh) => {
     on(sh, '[data-a="pay"]', () => {
       const amount = money(v(sh, 'amount'));
-      if (commit((s) => A.addPayment(s, { itemId: id, month, amount, date: v(sh, 'date'), note: v(sh, 'note') }, { today }), 'تم تأكيد الدفع')) closeSheet();
+      const confirmed = sw(sh, 'confirmed');
+      if (commit((s) => A.addPayment(s, { itemId: id, month, amount, date: v(sh, 'date'), note: v(sh, 'note'), confirmed }, { today }), confirmed ? 'تم تأكيد الدفع' : 'سُجلت الدفعة بانتظار التأكيد')) closeSheet();
     });
     on(sh, '[data-a="del-pay"]', (e, el) => {
       if (!confirm('حذف هذه الدفعة؟ سيُعاد حساب الخطة.')) return;
       if (commit((s) => A.deletePayment(s, el.dataset.id), 'تم الحذف')) cellSheet(month, id);
     });
     on(sh, '[data-a="edit-pay"]', (e, el) => editPaymentSheet(el.dataset.id, () => cellSheet(month, id)));
+    on(sh, '[data-a="confirm-pay"]', (e, el) => { if (commit((s) => A.confirmPayment(s, el.dataset.id), 'تم تأكيد السداد')) cellSheet(month, id, false); });
     on(sh, '[data-a="uncheck"]', () => {
       if (!confirm('إزالة علامة الصح ستحذف الدفعات الأساسية المسجلة لهذا البند في هذا الشهر. متابعة؟')) return;
       if (commit((s) => A.clearRegular(s, id, month), 'أزيلت علامة الصح')) closeSheet();
@@ -509,13 +524,29 @@ function cellSheet(month, id, focusPay = true) {
   });
 }
 
+function monthCloseSheet(month) {
+  const md = state.months[month] || {};
+  const cd = E.monthCloseDate(state, month);
+  openSheet(`${head(`إقفال ${E.monthLabel(month)}`, 'من تاريخ الإقفال يُحتسب غير المدفوع من خطة الشهر عجزًا يُرحّل')}
+    <div class="kv"><span class="k">تاريخ الإقفال</span><span class="v">${E.dateLabel(cd)}${md.closeDate ? '' : ' (تلقائي)'}</span></div>
+    <div class="note">الإقفال التلقائي بعد نهاية الشهر التالي، لأن بعض دفعات الشهر تُنفذ في الشهر التالي (مثل بدل الإيجار الذي يصل يوم 1 أو 2). تاريخ الدفعات نفسها مستقل، وكل دفعة تُنسب لخطة الشهر الذي تختاره.</div>
+    ${field('تاريخ إقفال مخصص', dateInput('cd', md.closeDate || ''))}
+    <button class="btn" data-a="save">حفظ التاريخ</button>
+    <button class="btn secondary" data-a="now">إقفال الشهر اليوم</button>
+    ${md.closeDate ? '<button class="btn secondary" data-a="auto">إرجاع للإقفال التلقائي</button>' : ''}`, (sh) => {
+    on(sh, '[data-a="save"]', () => { const x = v(sh, 'cd'); if (commit((s) => A.setMonthClose(s, month, x || null), 'تم الحفظ')) closeSheet(); });
+    on(sh, '[data-a="now"]', () => { if (confirm('إقفال الشهر اليوم؟ سيُرحّل غير المدفوع كعجز.') && commit((s) => A.setMonthClose(s, month, today), 'تم الإقفال')) closeSheet(); });
+    on(sh, '[data-a="auto"]', () => { if (commit((s) => A.setMonthClose(s, month, null), 'تمت الإعادة')) closeSheet(); });
+  });
+}
+
 function editPaymentSheet(pid, back) {
   const p = state.payments.find((x) => x.id === pid);
   if (!p) return;
   const it = E.itemById(state, p.itemId);
   openSheet(`${head('تعديل دفعة', `${esc(it?.name)} — ${p.kind === 'arrears' ? 'من العجز' : 'دفعة الشهر'}`)}
     <div class="row2">${field('المبلغ', moneyInput('amount', p.amount))}${field('التاريخ', dateInput('date', p.date))}</div>
-    ${field('الشهر', `<select class="input" name="month">${monthOptions(p.month)}</select>`)}
+    ${field('منسوبة لخطة شهر', `<select class="input" name="month">${monthOptions(p.month)}</select>`)}
     ${field('ملاحظة', `<input class="input" name="note" value="${esc(p.note)}">`)}
     <button class="btn" data-a="save">حفظ</button>`, (sh) => {
     on(sh, '[data-a="save"]', () => {
@@ -608,13 +639,15 @@ function debtSheet(id) {
       <div><div class="l">المتبقي</div><div class="v num">${fmtKD(st.remaining)}</div></div>
       <div><div class="l">الحالة</div><div class="v">${st.remaining === 0 ? (d.closedConfirmed ? '<span class="green">مغلق</span>' : 'مسدد — بانتظار التأكيد') : 'قائم'}</div></div>
     </div>
+    ${d.openingInferred ? '<div class="alert amber">الرصيد المرجعي مستنتج وليس رصيدًا بنكيًا مؤكدًا. عدّله من «البيانات» أو سجّل تصحيحًا.</div>' : ''}
+    ${st.pending ? `<div class="note">دفعات مسجلة بانتظار التأكيد: ${kd(st.pending)} د.ك (غير مخصومة من الرصيد).</div>` : ''}
     ${d.note ? `<div class="note">${esc(d.note)}</div>` : ''}
     ${st.remaining === 0 && !d.closedConfirmed ? '<button class="btn" data-a="close">تأكيد الإغلاق</button>' : ''}
     ${st.remaining === 0 && d.closedConfirmed ? '<button class="btn secondary" data-a="reopen">إلغاء تأكيد الإغلاق</button>' : ''}
 
     ${st.remaining > 0 ? `<div class="section-t">سداد</div>
     <div class="row2">${field('المبلغ', moneyInput('pamount', ''))}${field('التاريخ', dateInput('pdate', today))}</div>
-    ${field('يُحسب ضمن شهر', `<select class="input" name="pmonth">${monthOptions(view.month)}</select>`)}
+    ${field('منسوب لخطة شهر', `<select class="input" name="pmonth">${monthOptions(view.month)}</select>`)}
     <div class="quick"><button class="pill" data-a="fill-full">المبلغ كاملًا (<span class="num">${fmtKD(st.remaining)}</span>)</button></div>
     <button class="btn" data-a="pay">تسجيل السداد</button>` : ''}
 
@@ -768,6 +801,9 @@ function settingsSheet() {
   const debts = E.debtsOf(state).sort((a, b) => groupRank(a) - groupRank(b) || a.order - b.order);
   const exps = E.expensesOf(state).sort((a, b) => a.order - b.order);
   const recs = state.recurring || [];
+  const allowIds = new Set(debts.filter((d) => d.extra === 'allow').map((d) => d.id));
+  const prio = [...(s.payoffPriority || []).filter((id) => allowIds.has(id)), ...[...allowIds].filter((id) => !(s.payoffPriority || []).includes(id))];
+  const noAuto = debts.filter((d) => d.extra !== 'allow');
   const itemRow = (it) => `<button class="mi" data-item="${it.id}"><span class="ic">${it.icon || '•'}</span>${esc(it.name)}<span class="chev">‹</span></button>`;
   openSheet(`${head('الإعدادات')}
     <div class="section-t">الدخل الافتراضي</div>
@@ -777,6 +813,12 @@ function settingsSheet() {
     <div class="row2">${field('الحد الائتماني', moneyInput('vlimit', s.visaLimit))}${field('يوم تثبيت الكشف', `<input class="input" name="vday" inputmode="numeric" value="${s.visaStatementDay}">`)}</div>
     <button class="btn secondary" data-a="save">حفظ الإعدادات</button>
     <div class="note">تغيير القيم الافتراضية يؤثر على الأشهر التي لم تُعدَّل يدويًا فقط.</div>
+
+    <div class="section-t">أولويات السداد الإضافي (من مارس 2027)</div>
+    <div class="note" style="margin-top:0">بعد الأقساط الإلزامية والعجز، يُوجَّه الفائض بهذا الترتيب. الأشهر من سبتمبر إلى فبراير تبقى حسب خطتك الأصلية.</div>
+    <div class="list">${prio.map((id, i) => { const it = E.itemById(state, id); return `<div class="li"><div class="ic num" style="font-size:15px;font-weight:700">${i + 1}</div><div class="main"><div class="name">${it.icon || ''} ${esc(it.name)}</div></div><button class="icon-btn sm" data-up="${i}" aria-label="رفع" ${i === 0 ? 'disabled' : ''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 15 6-6 6 6"/></svg></button><button class="icon-btn sm" data-down="${i}" aria-label="خفض" ${i === prio.length - 1 ? 'disabled' : ''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></button></div>`; }).join('')}</div>
+    ${noAuto.length ? `<div class="note">لا يوزَّع عليها فائض تلقائيًا: ${noAuto.map((d) => esc(d.name)).join('، ')} (السداد المبكر بقرارك فقط).</div>` : ''}
+    <div class="quick"><button class="pill" data-a="prio-reset">الترتيب الافتراضي</button></div>
 
     <div class="section-t">القروض والديون</div>
     <div class="menu">${debts.map(itemRow).join('')}</div>
@@ -800,6 +842,10 @@ function settingsSheet() {
       if (ok) closeSheet();
     });
     on(sh, '[data-item]', (e, el) => openItem(el.dataset.item));
+    const move = (i, j) => { const next = [...prio]; [next[i], next[j]] = [next[j], next[i]]; if (commit((st) => A.setPayoffPriority(st, next), 'تم تعديل الأولويات')) settingsSheet(); };
+    on(sh, '[data-up]', (e, el) => { const i = Number(el.dataset.up); move(i, i - 1); });
+    on(sh, '[data-down]', (e, el) => { const i = Number(el.dataset.down); move(i, i + 1); });
+    on(sh, '[data-a="prio-reset"]', () => { if (commit((st) => A.resetPayoffPriority(st), 'تمت الإعادة')) settingsSheet(); });
     on(sh, '[data-a="new-debt"]', () => newDebtSheet('loan'));
     on(sh, '[data-a="new-exp"]', newExpenseSheet);
     on(sh, '[data-rec]', (e, el) => { if (confirm('حذف هذه الزيادة الشهرية من الخطة؟') && commit((st) => A.deleteRecurring(st, el.dataset.rec), 'تم الحذف')) settingsSheet(); });
@@ -914,6 +960,13 @@ document.addEventListener('click', (e) => {
     case 'cell-detail': cellSheet(d.m, d.id, false); break;
     case 'item': openItem(d.id); break;
     case 'arrears-pay': arrearsSheet(d.m, d.id); break;
+    case 'arrears-inline': {
+      const inp = document.querySelector(`[data-arr-in="${d.id}"]`);
+      const amount = money(inp?.value || '');
+      commit((s) => A.addPayment(s, { itemId: d.id, month: d.m, kind: 'arrears', amount, date: today }, { today }), 'تم السداد من العجز');
+      break;
+    }
+    case 'month-close': monthCloseSheet(view.month); break;
     case 'income': incomeSheet(d.kind); break;
     case 'income-toggle': {
       const x = d.kind === 'salary' ? E.salaryFor(state, view.month) : E.rentFor(state, view.month);
@@ -970,8 +1023,10 @@ async function boot() {
     s = E.createSeedState();
     await saveState(s);
   }
-  // ترحيلات مستقبلية للبيانات تُضاف هنا دون مسح أي شيء
-  s.recurring = s.recurring || [];
+  // ترحيل آمن للبيانات المحفوظة — لا يحذف شيئًا
+  const mig = E.migrate(s);
+  s = mig.state;
+  if (mig.changed) await saveState(s);
   state = s;
   const saved = lsGet('mfp-view-month');
   view.month = saved && /^\d{4}-\d{2}$/.test(saved) ? saved : today.slice(0, 7);

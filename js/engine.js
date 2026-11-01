@@ -3,7 +3,8 @@
 
 import { parseKD } from './money.js';
 
-export const SCHEMA = 1;
+export const SCHEMA = 2;
+export const DEFAULT_PRIORITY = ['violations', 'furniture', 'p_suhail', 'p_shafiq', 'p_electric', 'p_abuosama'];
 const MAX_MONTHS = 600;
 
 /* ───────────── التواريخ (Asia/Kuwait) ───────────── */
@@ -47,17 +48,21 @@ export const dateLabel = (date) => {
   return `${d} ${AR_MONTHS[m - 1]} ${y}`;
 };
 
-/** شهر الميزانية لتاريخ: الراتب ينزل يوم salaryDay، فما قبله يتبع الشهر السابق */
-export function budgetMonthOf(date, salaryDay) {
-  const m = monthOfDate(date);
-  const d = Number(date.slice(8, 10));
-  return d >= salaryDay ? m : addMonths(m, -1);
+/**
+ * تاريخ إقفال الشهر المالي: من هذا التاريخ يُعتبر غير المدفوع من خطة الشهر عجزًا.
+ * الافتراضي: أول يوم من الشهر الذي يلي الشهر التالي — لأن دفعات الشهر قد تُنفذ في الشهر
+ * التالي (مثل بدل الإيجار الذي يصل بداية الشهر التالي). يمكن تعديله لكل شهر يدويًا.
+ * لا علاقة له بيوم الراتب: تاريخ كل دفعة مستقل عن الشهر المالي المنسوبة إليه.
+ */
+export function monthCloseDate(state, key) {
+  const md = state.months[key] || {};
+  return md.closeDate || dateIn(addMonths(key, 2), 1);
 }
-
-/** يُغلق شهر الميزانية عند وصول راتب الشهر التالي */
-export function isMonthClosed(key, today, salaryDay) {
-  return today >= dateIn(addMonths(key, 1), salaryDay);
+export function isMonthClosed(state, key, today) {
+  return today >= monthCloseDate(state, key);
 }
+/** الدفعات المؤكدة فقط تدخل في الأرصدة والعجز والإجماليات */
+export const confirmedPayments = (state) => state.payments.filter((p) => p.confirmed !== false);
 
 /* ───────────── البيانات الأولية ───────────── */
 
@@ -73,9 +78,9 @@ export function createSeedState(nowIso = new Date().toISOString()) {
     { id: 'furniture', type: 'debt', group: 'loan', name: 'قرض الأثاث', icon: '🛋️', opening: KD(5510), mandatory: KD(460), extra: 'allow', start: '2026-09', order: 1 },
     { id: 'violations', type: 'debt', group: 'loan', name: 'قرض المخالفات', icon: '🚦', opening: KD(3672), mandatory: KD(164), extra: 'allow', start: '2026-09', order: 2 },
     { id: 'small', type: 'debt', group: 'loan', name: 'القرض الصغير', icon: '💳', opening: KD(940), openingInferred: true, mandatory: KD(170), extra: 'closeOnly', start: '2026-09', order: 3,
-      note: 'الرصيد مستنتج من مجموع الدفعات المجدولة (5×170 + 90). عدّله إذا عرفت الرصيد الحقيقي.' },
+      note: 'رصيد مستنتج من مجموع الأقساط المجدولة (5×170 + 90 = 940) — ليس رصيدًا بنكيًا مؤكدًا. عدّله إذا عرفت الرصيد الحقيقي.' },
     { id: 'shuoon', type: 'debt', group: 'loan', name: 'الشؤون', icon: '🏛️', opening: KD(559), mandatory: KD(137.5), extra: 'allow', start: '2026-10', order: 4,
-      note: 'مجموع الدفعات المجدولة: 4×137.500 + 9 = 559.' },
+      note: 'مجموع الدفعات المجدولة: 4×137.500 + 9 = 559. تبدأ في أكتوبر 2026.' },
     { id: 'p_suhail', type: 'debt', group: 'person', name: 'سهيل', icon: '👤', opening: KD(550), mandatory: 0, extra: 'allow', start: '2026-09', order: 10 },
     { id: 'p_shafiq', type: 'debt', group: 'person', name: 'شفيق', icon: '👤', opening: KD(24), mandatory: 0, extra: 'allow', start: '2026-09', order: 11 },
     { id: 'p_electric', type: 'debt', group: 'person', name: 'الكهربائي', icon: '👤', opening: KD(20), mandatory: 0, extra: 'allow', start: '2026-09', order: 12 },
@@ -118,6 +123,7 @@ export function createSeedState(nowIso = new Date().toISOString()) {
       rentArrivalDay: 1,
       visaLimit: KD(1000),
       visaStatementDay: 15,
+      payoffPriority: [...DEFAULT_PRIORITY],
     },
     items,
     months,
@@ -198,7 +204,10 @@ export function simulate(state, opts = {}) {
   const startIdx = monthIndex(s.planStart);
   const autoFromIdx = monthIndex(s.autoFrom);
 
-  const payments = baseline ? [] : state.payments;
+  const payments = baseline ? [] : confirmedPayments(state);
+  const pendingMap = sumBy(baseline ? [] : state.payments.filter((p) => p.confirmed === false), (p) => `${p.month}|${p.itemId}|${p.kind}`);
+  const priority = s.payoffPriority || DEFAULT_PRIORITY;
+  const prioRank = (item) => { const i = priority.indexOf(item.id); return i < 0 ? 1e6 + item.order : i; };
   const payMap = sumBy(payments, (p) => `${p.month}|${p.itemId}|${p.kind}`);
   const hasPay = new Set(payments.map((p) => `${p.month}|${p.itemId}|${p.kind}`));
   const adjMap = sumBy(baseline ? [] : state.adjustments, (a) => a.itemId);
@@ -225,7 +234,7 @@ export function simulate(state, opts = {}) {
     const key = monthKey(idx);
     const md = state.months[key] || {};
     const planVals = md.plan || {};
-    const closed = !baseline && isMonthClosed(key, today, s.salaryDay);
+    const closed = !baseline && isMonthClosed(state, key, today);
     const isAuto = idx >= autoFromIdx;
 
     const sal = salaryFor(state, key);
@@ -265,6 +274,7 @@ export function simulate(state, opts = {}) {
         regRealized: closed || hasPay.has(`${key}|${d.id}|regular`),
         arrRealized: closed || hasPay.has(`${key}|${d.id}|arrears`),
         projReg: 0, projArr: 0, extraSuggested: 0, unmet: 0,
+        pendingReg: pendingMap.get(`${key}|${d.id}|regular`) || 0,
         carry: true,
       });
     }
@@ -285,6 +295,7 @@ export function simulate(state, opts = {}) {
         regRealized: closed || hasPay.has(`${key}|${e.id}|regular`),
         arrRealized: closed || hasPay.has(`${key}|${e.id}|arrears`),
         projReg: 0, projArr: 0, extraSuggested: 0, unmet: 0,
+        pendingReg: pendingMap.get(`${key}|${e.id}|regular`) || 0,
         carry: !!e.carry,
       });
     }
@@ -317,22 +328,17 @@ export function simulate(state, opts = {}) {
       if (l.arrRealized || l.arrStart <= 0) continue;
       l.projArr = take(l.arrStart);
     }
-    // هـ) توزيع السيولة الإضافية (أشهر الجدولة التلقائية فقط) — الأصغر رصيدًا أولًا
+    // هـ) توزيع السيولة الإضافية (أشهر الجدولة التلقائية فقط) حسب أولويات السداد:
+    //    الافتراضي: المخالفات ← الأثاث ← ديون الأشخاص. القروض التي لا تسمح بالسداد الإضافي
+    //    (مثل القرض الصغير: إغلاق كامل فقط بقرار المستخدم) لا تُوزَّع عليها أي مبالغ تلقائيًا.
     if (isAuto && !closed) {
-      const cands = lines.filter((l) => l.type === 'debt' && l.engineManaged && !l.regRealized && l.item.extra !== 'none');
-      cands.sort((a, b) => {
-        const ra = a.balStart - a.projReg - a.projArr; const rb = b.balStart - b.projReg - b.projArr;
-        return ra - rb || a.item.order - b.item.order;
-      });
+      const cands = lines.filter((l) => l.type === 'debt' && l.engineManaged && !l.regRealized && l.item.extra === 'allow');
+      cands.sort((a, b) => prioRank(a.item) - prioRank(b.item));
       for (const l of cands) {
         if (avail <= 0) break;
         const remaining = l.balStart - l.arrStart - l.projReg; // دون العجز (يُسدد في د)
         if (remaining <= 0) continue;
-        if (l.item.extra === 'closeOnly') {
-          if (avail >= remaining) { take(remaining); l.extraSuggested = remaining; l.projReg += remaining; }
-        } else {
-          const got = take(remaining); l.extraSuggested = got; l.projReg += got;
-        }
+        const got = take(remaining); l.extraSuggested = got; l.projReg += got;
       }
     }
 
@@ -357,9 +363,10 @@ export function simulate(state, opts = {}) {
       }
       l.arrEnd = arr[l.id];
       // حالة علامة الصح
-      if (l.planned <= 0 && l.paidReg === 0) l.status = 'na';
+      if (l.planned <= 0 && l.paidReg === 0 && l.pendingReg === 0) l.status = 'na';
       else if (l.paidReg >= l.planned && l.paidReg > 0) l.status = 'done';
       else if (l.paidReg > 0) l.status = 'partial';
+      else if (l.pendingReg > 0) l.status = 'recorded';
       else l.status = 'none';
       l.belowMandatory = l.type === 'debt' && l.regRealized && l.mandatoryCap > 0 && l.paidReg < l.mandatoryCap;
     }
@@ -398,21 +405,25 @@ export function simulate(state, opts = {}) {
 
 export function debtStatus(state, debt) {
   const adj = state.adjustments.filter((a) => a.itemId === debt.id).reduce((a, x) => a + x.delta, 0);
-  const paid = state.payments.filter((p) => p.itemId === debt.id).reduce((a, x) => a + x.amount, 0);
+  const paid = confirmedPayments(state).filter((p) => p.itemId === debt.id).reduce((a, x) => a + x.amount, 0);
+  const pending = state.payments.filter((p) => p.itemId === debt.id && p.confirmed === false).reduce((a, x) => a + x.amount, 0);
   const original = debt.opening + adj;
-  return { original, paid, adj, remaining: Math.max(0, original - paid), overpaid: Math.max(0, paid - original) };
+  return { opening: debt.opening, original, paid, pending, adj, remaining: Math.max(0, original - paid), overpaid: Math.max(0, paid - original) };
 }
 
 export function dashboard(state, sim) {
-  let original = 0; let paid = 0; let remaining = 0;
+  let original = 0; let paid = 0; let remaining = 0; let initial = 0; let inferred = 0;
   for (const d of debtsOf(state)) {
     const st = debtStatus(state, d);
-    original += st.original; paid += st.paid; remaining += st.remaining;
+    original += st.original; paid += st.paid; remaining += st.remaining; initial += d.opening;
+    if (d.openingInferred) inferred += d.opening;
   }
+  // نسبة الإنجاز = انخفاض الرصيد الفعلي ÷ الإجمالي (شاملًا التصحيحات)
+  const reduced = Math.max(0, original - remaining);
   const end = sim.endMonth;
   const base = state.baseline?.endMonth || null;
   const delta = end && base ? monthIndex(end) - monthIndex(base) : null; // سالب = متقدم
-  return { original, paid, remaining, endMonth: end, baselineEnd: base, deltaMonths: delta };
+  return { initial, original, paid, remaining, reduced, inferred, endMonth: end, baselineEnd: base, deltaMonths: delta };
 }
 
 /* ───────────── الفيزا ───────────── */
@@ -485,7 +496,8 @@ export function runScenario(state, sc, today = kuwaitToday()) {
   const curL = simulate(state, { today, until: last });
   const altL = simulate(state, { today, until: last, virtualExtras: scenarioExtras(sc) });
   const rows = [];
-  const from = budgetMonthOf(today, state.settings.salaryDay);
+  const firstOpen = curL.months.find((m) => !m.closed);
+  const from = firstOpen ? firstOpen.key : monthOfDate(today);
   for (const m of curL.months) {
     if (m.key < from) continue;
     if (m.key > last) break;
@@ -500,4 +512,59 @@ export function addDays(date, n) {
   const [y, m, d] = date.split('-').map(Number);
   const t = new Date(Date.UTC(y, m - 1, d + n));
   return t.toISOString().slice(0, 10);
+}
+
+/* ───────────── ترحيل البيانات المحفوظة (بلا حذف) ───────────── */
+
+/**
+ * يرفع البيانات المحفوظة إلى أحدث نموذج دون حذف أي شيء.
+ * يرجع { state, changed }. لا يمس الدفعات أو الأرصدة أو الكشوف.
+ */
+export function migrate(input) {
+  const state = input;
+  let changed = false;
+  const from = state.schema || 1;
+  state.settings = state.settings || {};
+  state.recurring = state.recurring || [];
+  state.extras = state.extras || [];
+  state.payments = state.payments || [];
+  state.adjustments = state.adjustments || [];
+  state.visa = state.visa || { purchases: [], payments: [], statements: [] };
+  state.log = state.log || [];
+  if (from < 2) {
+    // v2: أولويات السداد، حالة تأكيد الدفعات، إقفال الشهر مستقل عن يوم الراتب
+    if (!Array.isArray(state.settings.payoffPriority)) {
+      const ids = new Set(state.items.map((i) => i.id));
+      const extraIds = state.items.filter((i) => i.type === 'debt' && i.extra === 'allow' && !DEFAULT_PRIORITY.includes(i.id))
+        .sort((a, b) => a.order - b.order).map((i) => i.id);
+      state.settings.payoffPriority = [...DEFAULT_PRIORITY.filter((id) => ids.has(id)), ...extraIds];
+    }
+    // الدفعات في النسخة الأولى كانت كلها تأكيدات سداد
+    for (const p of state.payments) if (p.confirmed === undefined) p.confirmed = true;
+    const small = state.items.find((i) => i.id === 'small');
+    if (small && small.openingInferred) small.note = 'رصيد مستنتج من مجموع الأقساط المجدولة (5×170 + 90 = 940) — ليس رصيدًا بنكيًا مؤكدًا. عدّله إذا عرفت الرصيد الحقيقي.';
+    const oldBaseline = state.baseline?.endMonth || null;
+    state.baseline = { endMonth: simulate(state, { baseline: true }).endMonth, previous: oldBaseline };
+    state.schema = 2;
+    state.log.push({ ts: new Date().toISOString(), text: 'تحديث نموذج البيانات إلى الإصدار 2 (أولويات السداد وتأكيد الدفعات) — دون حذف أي بيانات.' });
+    changed = true;
+  }
+  return { state, changed };
+}
+
+/* ───────────── موثوقية التوقع ───────────── */
+
+/** تنبيهات تبيّن ما يعتمد عليه موعد الإغلاق المتوقع */
+export function planReliability(state, sim, today = kuwaitToday()) {
+  const unconfirmedPast = [];
+  const gaps = [];
+  for (const m of sim.months) {
+    if (m.closed) {
+      for (const l of m.lines) if (l.planned > 0 && l.paidReg === 0 && l.carry) unconfirmedPast.push({ key: m.key, id: l.id });
+    } else if (m.fundingGap > 0) gaps.push({ key: m.key, amount: m.fundingGap });
+  }
+  const futureIncomeUnconfirmed = sim.months.filter((m) => !m.closed && !m.income.salary.received).length;
+  const inferred = debtsOf(state).filter((d) => d.openingInferred);
+  const pendingExtras = state.extras.filter((e) => e.status === 'pending');
+  return { unconfirmedPast, gaps, futureIncomeUnconfirmed, inferred, pendingExtras, reliable: !!sim.endMonth && gaps.length === 0 };
 }

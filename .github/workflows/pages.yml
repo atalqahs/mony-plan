@@ -1,7 +1,6 @@
 name: Deploy to GitHub Pages
+# النشر يدوي فقط (Actions → Deploy to GitHub Pages → Run workflow) — لا نشر تلقائي عند الرفع
 on:
-  push:
-    branches: [main, claude/financial-plan-app-c7d4yj]
   workflow_dispatch:
 permissions:
   contents: read

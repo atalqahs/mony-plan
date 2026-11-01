@@ -1,7 +1,7 @@
 // عمليات تعديل الحالة مع التحقق. كل دالة ترجع null عند النجاح أو رسالة خطأ.
 import {
   simulate, uid, itemById, debtStatus, visaSummary, kuwaitToday, monthLabel, dateLabel,
-  visaCycleEnd, budgetMonthOf,
+  visaCycleEnd, monthOfDate, DEFAULT_PRIORITY,
 } from './engine.js';
 import { fmtKD } from './money.js';
 
@@ -13,7 +13,11 @@ const okMonth = (m) => typeof m === 'string' && /^\d{4}-\d{2}$/.test(m);
 
 /* ── الدفعات ── */
 
-export function addPayment(state, { itemId, month, kind = 'regular', amount, date, note = '' }, opts = {}) {
+/**
+ * تسجيل دفعة. month = الشهر المالي المنسوبة إليه الدفعة، date = تاريخ التنفيذ الفعلي (مستقلان).
+ * confirmed=false: دفعة مسجلة لم يتأكد سدادها بعد — لا تدخل في الأرصدة أو العجز حتى تأكيدها.
+ */
+export function addPayment(state, { itemId, month, kind = 'regular', amount, date, note = '', confirmed = true }, opts = {}) {
   const item = itemById(state, itemId);
   if (!item) return 'البند غير موجود';
   if (!okMonth(month)) return 'الشهر غير صالح';
@@ -22,17 +26,27 @@ export function addPayment(state, { itemId, month, kind = 'regular', amount, dat
   if (kind !== 'regular' && kind !== 'arrears') return 'نوع الدفعة غير صالح';
   if (item.type === 'debt') {
     const st = debtStatus(state, item);
-    if (amount > st.remaining) return `المبلغ يتجاوز الرصيد المتبقي (${fmtKD(st.remaining)} د.ك)`;
+    const free = st.remaining - st.pending; // نحتسب الدفعات المسجلة غير المؤكدة لمنع تجاوز الرصيد
+    if (amount > free) return `المبلغ يتجاوز الرصيد المتبقي (${fmtKD(Math.max(0, free))} د.ك)`;
+    if (item.extra === 'closeOnly' && kind === 'regular') {
+      const sim = simulate(state, { today: opts.today, until: month });
+      const l = sim.byKey[month]?.lines.find((x) => x.id === itemId);
+      const planLeft = l ? Math.max(0, l.planned - l.paidReg - l.pendingReg) : 0;
+      if (amount > planLeft && amount !== free) {
+        return `${item.name}: لا يُسمح بسداد إضافي جزئي. ادفع القسط المخطط (${fmtKD(planLeft)}) أو أغلق الرصيد كاملًا (${fmtKD(free)}).`;
+      }
+    }
   }
   if (kind === 'arrears') {
     const sim = simulate(state, { today: opts.today, until: month });
     const line = sim.byKey[month]?.lines.find((l) => l.id === itemId);
-    const rem = line ? line.arrRemaining : 0;
+    const pendArr = state.payments.filter((x) => x.confirmed === false && x.kind === 'arrears' && x.itemId === itemId && x.month === month).reduce((a, x) => a + x.amount, 0);
+    const rem = Math.max(0, (line ? line.arrRemaining : 0) - pendArr);
     if (amount > rem) return `المبلغ أكبر من العجز المتبقي (${fmtKD(rem)} د.ك)`;
   }
-  const p = { id: uid('pay'), itemId, month, kind, amount, date, note, createdAt: nowIso() };
+  const p = { id: uid('pay'), itemId, month, kind, amount, date, note, confirmed: !!confirmed, createdAt: nowIso() };
   state.payments.push(p);
-  log(state, `${kind === 'arrears' ? 'سداد من العجز' : 'دفعة'} — ${item.name} — ${monthLabel(month)}: ${fmtKD(amount)} د.ك بتاريخ ${dateLabel(date)}`);
+  log(state, `${kind === 'arrears' ? 'سداد من العجز' : 'دفعة'}${confirmed ? '' : ' (مسجلة — بانتظار التأكيد)'} — ${item.name} — خطة ${monthLabel(month)}: ${fmtKD(amount)} د.ك بتاريخ ${dateLabel(date)}`);
   return null;
 }
 
@@ -51,6 +65,17 @@ export function updatePayment(state, id, patch, opts = {}) {
   state.log.pop();
   const item = itemById(state, p.itemId);
   log(state, `تعديل دفعة — ${item?.name}: ${fmtKD(before.amount)} ← ${fmtKD(added.amount)} د.ك (${monthLabel(added.month)})`);
+  return null;
+}
+
+export function confirmPayment(state, id, date) {
+  const p = state.payments.find((x) => x.id === id);
+  if (!p) return 'الدفعة غير موجودة';
+  if (p.confirmed !== false) return 'الدفعة مؤكدة مسبقًا';
+  p.confirmed = true;
+  if (date) p.date = date;
+  p.confirmedAt = nowIso();
+  log(state, `تأكيد سداد — ${itemById(state, p.itemId)?.name}: ${fmtKD(p.amount)} د.ك (خطة ${monthLabel(p.month)})`);
   return null;
 }
 
@@ -165,6 +190,7 @@ export function addItem(state, data) {
       start: data.start || state.settings.planStart, order, closedConfirmed: false, createdAt: nowIso(),
     };
     state.items.push(it);
+    if (it.extra === 'allow') state.settings.payoffPriority = [...(state.settings.payoffPriority || []), it.id];
     log(state, `إضافة دين — ${name}: ${fmtKD(it.opening)} د.ك`);
     return null;
   }
@@ -192,6 +218,10 @@ export function updateItem(state, id, patch) {
   }
   const changes = Object.keys(patch).join('، ');
   Object.assign(it, patch);
+  if (it.type === 'debt' && it.extra === 'allow') {
+    const pr = state.settings.payoffPriority || (state.settings.payoffPriority = []);
+    if (!pr.includes(it.id)) pr.push(it.id);
+  }
   if (patch.opening !== undefined) it.openingInferred = false;
   log(state, `تعديل بند — ${it.name} (${changes})`);
   return null;
@@ -212,6 +242,7 @@ export function deleteItem(state, id) {
   const it = itemById(state, id);
   if (!it) return 'البند غير موجود';
   state.items = state.items.filter((i) => i.id !== id);
+  if (state.settings.payoffPriority) state.settings.payoffPriority = state.settings.payoffPriority.filter((x) => x !== id);
   const n = state.payments.filter((p) => p.itemId === id).length;
   state.payments = state.payments.filter((p) => p.itemId !== id);
   state.adjustments = state.adjustments.filter((a) => a.itemId !== id);
@@ -275,7 +306,8 @@ export function addVisaPayment(state, { date, amount, note = '', cashMonth }, to
   if (!okAmount(amount)) return 'أدخل مبلغًا أكبر من صفر';
   const vs = visaSummary(state, today);
   if (amount > vs.used) return `المبلغ أكبر من المستخدم غير المسدد (${fmtKD(vs.used)} د.ك)`;
-  const cm = cashMonth === undefined ? budgetMonthOf(date, state.settings.salaryDay) : cashMonth;
+  // يُخصم من سيولة شهر واحد فقط (أو لا يُخصم) — لا خصم مزدوج
+  const cm = cashMonth === undefined ? monthOfDate(date) : cashMonth;
   state.visa.payments.push({ id: uid('vy'), date, amount, note, cashMonth: cm || null, createdAt: nowIso() });
   log(state, `فيزا — سداد ${fmtKD(amount)} د.ك بتاريخ ${dateLabel(date)}${cm ? ` (من سيولة ${monthLabel(cm)})` : ''}`);
   return null;
@@ -327,5 +359,30 @@ export function deleteRecurring(state, id) {
   if (i < 0) return 'غير موجود';
   const [r] = list.splice(i, 1);
   log(state, `حذف زيادة شهرية ${fmtKD(r.amount)} د.ك من ${monthLabel(r.start)}`);
+  return null;
+}
+
+/* ── أولويات السداد وإقفال الأشهر ── */
+
+export function setPayoffPriority(state, ids) {
+  const debts = new Set(state.items.filter((i) => i.type === 'debt').map((i) => i.id));
+  if (!Array.isArray(ids) || ids.some((id) => !debts.has(id)) || new Set(ids).size !== ids.length) return 'ترتيب غير صالح';
+  state.settings.payoffPriority = [...ids];
+  log(state, `تعديل أولويات السداد: ${ids.map((id) => itemById(state, id)?.name).join(' ← ')}`);
+  return null;
+}
+export function resetPayoffPriority(state) {
+  const ids = new Set(state.items.map((i) => i.id));
+  const rest = (state.settings.payoffPriority || []).filter((id) => ids.has(id) && !DEFAULT_PRIORITY.includes(id));
+  return setPayoffPriority(state, [...DEFAULT_PRIORITY.filter((id) => ids.has(id)), ...rest]);
+}
+
+/** تاريخ إقفال شهر مالي (null = تلقائي) */
+export function setMonthClose(state, month, date) {
+  if (!okMonth(month)) return 'الشهر غير صالح';
+  if (date !== null && !okDate(date)) return 'التاريخ غير صالح';
+  if (!state.months[month]) state.months[month] = { plan: {} };
+  if (date === null) delete state.months[month].closeDate; else state.months[month].closeDate = date;
+  log(state, `إقفال ${monthLabel(month)}: ${date ? `من ${dateLabel(date)}` : 'تلقائي'}`);
   return null;
 }

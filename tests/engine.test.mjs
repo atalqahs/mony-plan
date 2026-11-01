@@ -88,8 +88,11 @@ test('6: تعديل دفعة قديمة يعيد حساب كل الأشهر ال
   assert.equal(line(st, '2026-10', 'violations').arrStart, KD(237.8));
   // أكتوبر مفتوح: المحرك يتوقع سداد العجز من السيولة، فيبقى رصيد فبراير كما هو
   assert.equal(line(st, '2027-02', 'violations').balStart, balBefore);
-  // لو أُغلق أكتوبر دون سداد، يبقى العجز ويُرحّل
-  assert.equal(line(st, '2026-11', 'violations', '2026-11-25').arrStart, KD(237.8) + KD(164));
+  // لو أُقفل أكتوبر (تلقائيًا في 1 ديسمبر) دون سداد، يبقى العجز ويُرحّل
+  assert.equal(line(st, '2026-11', 'violations', '2026-12-01').arrStart, KD(237.8) + KD(164));
+  // تسجيل دفعات أكتوبر يعيد الحساب فورًا
+  ok(A.addPayment(st, { itemId: 'violations', month: '2026-10', amount: KD(164), date: '2026-10-25' }, { today: TODAY }));
+  assert.equal(line(st, '2026-11', 'violations', '2026-12-01').arrStart, KD(237.8));
 });
 
 test('7: سيناريو 500 شهريًا لا يغير الخطة الفعلية ويقرّب الموعد', () => {
@@ -273,4 +276,224 @@ test('الحتمية: نفس العمليات بنفس النتيجة بغض ا�
   const sa = E.simulate(a, { today: TODAY }); const sb = E.simulate(b, { today: TODAY });
   assert.equal(sa.endMonth, sb.endMonth);
   assert.deepEqual(sa.months.map((m) => m.cashEnd), sb.months.map((m) => m.cashEnd));
+});
+
+/* ───────────── اختبارات المراجعة الثانية ───────────── */
+
+const autoLine = (st, m, id, today = TODAY) => E.simulate(st, { today, until: m }).byKey[m].lines.find((l) => l.id === id);
+const payAllPlanned = (st, months) => {
+  for (const m of months) {
+    for (const l of E.simulate(st, { today: TODAY, until: m }).byKey[m].lines) {
+      if (l.planned > 0) ok(A.addPayment(st, { itemId: l.id, month: m, amount: l.planned, date: `${m}-25` }, { today: TODAY }));
+    }
+  }
+};
+
+test('أولوية 1: المخالفات أولًا ثم الأثاث ثم الأشخاص', () => {
+  const st = fresh();
+  assert.deepEqual(st.settings.payoffPriority, ['violations', 'furniture', 'p_suhail', 'p_shafiq', 'p_electric', 'p_abuosama']);
+  const sim = E.simulate(st, { baseline: true });
+  const mar = sim.byKey['2027-03'];
+  const g = (id) => mar.lines.find((l) => l.id === id);
+  assert.equal(g('violations').balEnd, 0, 'المخالفات تُغلق أولًا');
+  assert.ok(g('furniture').extraSuggested > 0, 'الفائض بعد المخالفات للأثاث');
+  assert.ok(g('furniture').balEnd > 0);
+  for (const id of ['p_suhail', 'p_shafiq', 'p_electric', 'p_abuosama']) assert.equal(g(id).regUsed, 0, `${id} لا يُسدد قبل إغلاق الأثاث`);
+  // بعد إغلاق الأثاث يبدأ الأشخاص بالترتيب
+  const apr = sim.byKey['2027-04'];
+  assert.equal(apr.lines.find((l) => l.id === 'furniture').balEnd, 0);
+  assert.equal(apr.lines.find((l) => l.id === 'p_suhail').balEnd, 0);
+});
+
+test('أولوية 2: لا يوزَّع الفائض على أصغر دين تلقائيًا', () => {
+  const st = fresh();
+  const mar = E.simulate(st, { baseline: true }).byKey['2027-03'];
+  const elec = mar.lines.find((l) => l.id === 'p_electric');
+  const furn = mar.lines.find((l) => l.id === 'furniture');
+  assert.equal(elec.regUsed, 0, 'الكهربائي (أصغر دين 20) لا يأخذ شيئًا والأثاث قائم');
+  assert.ok(furn.balEnd > 0);
+});
+
+test('أولوية 3: القرض الصغير لا يُسدد مبكرًا تلقائيًا ولا جزئيًا', () => {
+  const st = fresh();
+  ok(A.updateItem(st, 'small', { opening: KD(2000) })); // رصيد افتراضي للاختبار فقط
+  const sim = E.simulate(st, { baseline: true, until: '2027-06' });
+  for (const k of ['2027-03', '2027-04', '2027-05']) {
+    const l = sim.byKey[k].lines.find((x) => x.id === 'small');
+    assert.equal(l.extraSuggested, 0, k);
+    assert.equal(l.planned, KD(170), k);
+  }
+  // سداد إضافي جزئي مرفوض، والإغلاق الكامل مسموح بقرار المستخدم
+  assert.match(A.addPayment(st, { itemId: 'small', month: '2026-11', amount: KD(500), date: '2026-11-25' }, { today: TODAY }) || '', /لا يُسمح بسداد إضافي جزئي/);
+  ok(A.addPayment(st, { itemId: 'small', month: '2026-11', amount: KD(170), date: '2026-11-25' }, { today: TODAY }));
+  ok(A.addPayment(st, { itemId: 'small', month: '2026-11', amount: KD(1830), date: '2026-11-26' }, { today: TODAY }));
+  assert.equal(E.debtStatus(st, E.itemById(st, 'small')).remaining, 0);
+});
+
+test('أولوية 4: يمكن تعديل الأولويات من الإعدادات', () => {
+  const st = fresh();
+  ok(A.setPayoffPriority(st, ['p_electric', 'violations', 'furniture', 'p_suhail', 'p_shafiq', 'p_abuosama']));
+  const mar = E.simulate(st, { baseline: true }).byKey['2027-03'];
+  assert.equal(mar.lines.find((l) => l.id === 'p_electric').balEnd, 0);
+  ok(A.resetPayoffPriority(st));
+  assert.equal(st.settings.payoffPriority[0], 'violations');
+});
+
+test('أولوية 5: الخطة الأصلية سبتمبر–فبراير لا تتغير بوجود فائض', () => {
+  const st = fresh();
+  ok(A.addExtra(st, { month: '2026-11', name: 'مبلغ مستلم', amount: KD(3000), status: 'received' }));
+  const sim = E.simulate(st, { today: TODAY, until: '2027-02' });
+  const exp = { '2026-11': 702.15, '2026-12': 702.15, '2027-01': 252.15, '2027-02': 760.65 };
+  for (const [m, v] of Object.entries(exp)) assert.equal(sim.byKey[m].lines.find((l) => l.id === 'violations').planned, KD(v), m);
+});
+
+test('بدل الإيجار: دفعة في الشهر التالي تُنسب لخطة الشهر الأصلي', () => {
+  const st = fresh();
+  ok(A.addPayment(st, { itemId: 'violations', month: '2026-11', amount: KD('552.150'), date: '2026-11-23' }, { today: TODAY }));
+  ok(A.addPayment(st, { itemId: 'violations', month: '2026-11', amount: KD(150), date: '2026-12-02', note: 'من بدل إيجار نوفمبر' }, { today: TODAY }));
+  const today = '2026-12-03';
+  const sim = E.simulate(st, { today, until: '2027-01' });
+  const nov = sim.byKey['2026-11'].lines.find((l) => l.id === 'violations');
+  const dec = sim.byKey['2026-12'].lines.find((l) => l.id === 'violations');
+  assert.equal(nov.paidReg, KD('702.150'));
+  assert.equal(nov.status, 'done');
+  assert.equal(dec.paidReg, 0, 'لا تُحسب على ديسمبر رغم أن تاريخها في ديسمبر');
+  assert.equal(dec.arrStart, 0);
+  assert.equal(sim.byKey['2026-12'].actualOut, 0);
+  // بدل إيجار نوفمبر ضمن ميزانية نوفمبر فقط
+  assert.equal(sim.byKey['2026-11'].income.planned, KD('1729.650') + KD(150));
+  assert.equal(sim.byKey['2026-12'].income.planned, KD('1729.650') + KD(150));
+});
+
+test('إقفال الشهر مستقل عن يوم الراتب ويمكن تعديله', () => {
+  const st = fresh();
+  assert.equal(E.monthCloseDate(st, '2026-11'), '2027-01-01');
+  assert.equal(E.isMonthClosed(st, '2026-11', '2026-12-22'), false, 'لا يُقفل يوم 22');
+  ok(A.setMonthClose(st, '2026-11', '2026-12-10'));
+  assert.equal(E.isMonthClosed(st, '2026-11', '2026-12-10'), true);
+  ok(A.setMonthClose(st, '2026-11', null));
+  assert.equal(E.monthCloseDate(st, '2026-11'), '2027-01-01');
+});
+
+test('منع مضاعفة العجز: أشهر غير مؤكدة لا تضيف إلى رصيد الدين', () => {
+  const st = fresh();
+  const today = '2027-01-05'; // سبتمبر وأكتوبر ونوفمبر مقفلة دون أي دفعة
+  const sim = E.simulate(st, { today, until: '2027-02' });
+  const f = (m) => sim.byKey[m].lines.find((l) => l.id === 'furniture');
+  assert.equal(f('2026-10').arrStart, KD(460));
+  assert.equal(f('2026-11').arrStart, KD(920));
+  assert.equal(f('2026-12').arrStart, KD(1380));
+  for (const m of ['2026-10', '2026-11', '2026-12']) {
+    assert.equal(f(m).balStart, KD(5510), `${m}: الرصيد لم يتغير`);
+    assert.ok(f(m).arrStart + f(m).planned <= f(m).balStart);
+  }
+  assert.equal(E.dashboard(st, sim).remaining, KD(11725));
+  // سداد جزء من العجز يُخصم مرة واحدة
+  ok(A.addPayment(st, { itemId: 'furniture', month: '2026-12', kind: 'arrears', amount: KD(500), date: '2027-01-04' }, { today }));
+  const sim2 = E.simulate(st, { today, until: '2027-02' });
+  assert.equal(sim2.byKey['2026-12'].lines.find((l) => l.id === 'furniture').arrRemaining, KD(880));
+  assert.equal(E.debtStatus(st, E.itemById(st, 'furniture')).remaining, KD(5010));
+});
+
+test('الدفعة المسجلة غير المؤكدة لا تُخصم حتى تأكيدها', () => {
+  const st = fresh();
+  ok(A.addPayment(st, { itemId: 'furniture', month: '2026-11', amount: KD(460), date: '2026-11-25', confirmed: false }, { today: TODAY }));
+  assert.equal(E.debtStatus(st, E.itemById(st, 'furniture')).remaining, KD(5510));
+  assert.equal(line(st, '2026-11', 'furniture').status, 'recorded');
+  assert.equal(E.dashboard(st, E.simulate(st, { today: TODAY })).paid, 0);
+  ok(A.confirmPayment(st, st.payments[0].id));
+  assert.equal(E.debtStatus(st, E.itemById(st, 'furniture')).remaining, KD(5050));
+  assert.equal(line(st, '2026-11', 'furniture').status, 'done');
+});
+
+test('الإجمالي الابتدائي 11,725 ونسبة الإنجاز من انخفاض الرصيد', () => {
+  const st = fresh();
+  let d = E.dashboard(st, E.simulate(st, { today: TODAY }));
+  assert.equal(d.initial, KD(11725));
+  assert.equal(d.inferred, KD(940));
+  A.addPayment(st, { itemId: 'violations', month: '2026-11', amount: KD(160), date: '2026-11-25' }, { today: TODAY });
+  A.addPayment(st, { itemId: 'p_suhail', month: '2026-11', amount: KD(100), date: '2026-11-25' }, { today: TODAY });
+  d = E.dashboard(st, E.simulate(st, { today: TODAY }));
+  assert.equal(d.reduced, KD(260));
+  assert.equal(d.remaining, KD(11725) - KD(260));
+});
+
+test('الدخل الافتراضي ليس دخلًا فعليًا: مكافأة 800 وزيادة 350/500', () => {
+  const st = fresh();
+  const base = E.simulate(st, { today: TODAY });
+  ok(A.addExtra(st, { month: '2026-12', name: 'مكافأة الأعمال الممتازة', amount: KD(800), status: 'pending' }));
+  const after = E.simulate(st, { today: TODAY });
+  assert.equal(after.endMonth, base.endMonth);
+  assert.deepEqual(after.months.map((m) => m.cashEnd), base.months.map((m) => m.cashEnd));
+  assert.equal(after.byKey['2026-12'].income.received, 0);
+  const before = JSON.stringify(st);
+  for (const amt of [350, 500]) E.runScenario(st, { type: 'monthly', amount: KD(amt), start: '2026-12' }, TODAY);
+  assert.equal(JSON.stringify(st), before, 'السيناريو لا يغيّر البيانات');
+  assert.equal(E.simulate(st, { today: TODAY }).endMonth, base.endMonth);
+  const rel = E.planReliability(st, after, TODAY);
+  assert.equal(rel.pendingExtras.length, 1);
+  assert.ok(rel.futureIncomeUnconfirmed > 0);
+});
+
+test('الفيزا: 400 مثبتة على نوفمبر و120 بعد يوم 15 على ديسمبر', () => {
+  const st = fresh();
+  ok(A.addVisaPurchase(st, { date: '2026-11-10', amount: KD(400) }));
+  ok(A.confirmStatement(st, '2026-11-15', '2026-11-15'));
+  ok(A.addVisaPurchase(st, { date: '2026-11-16', amount: KD(70) }));
+  ok(A.addVisaPurchase(st, { date: '2026-12-15', amount: KD(50) }));
+  const vs = E.visaSummary(st, '2026-12-01');
+  assert.equal(vs.last.cycleEnd, '2026-11-15');
+  assert.equal(vs.last.amount, KD(400));
+  assert.equal(vs.unbilled, KD(120));
+  assert.equal(vs.used, KD(520));
+  assert.equal(vs.available, KD(480));
+  assert.equal(vs.dueUnpaid, KD(400));
+  ok(A.confirmStatement(st, '2026-12-15', '2026-12-15'));
+  const vs2 = E.visaSummary(st, '2026-12-15');
+  assert.equal(st.visa.statements.find((s) => s.cycleEnd === '2026-11-15').amount, KD(400));
+  assert.equal(vs2.last.amount, KD(120));
+});
+
+test('الفيزا: السداد يُخصم من سيولة شهر واحد فقط', () => {
+  const st = fresh();
+  A.addVisaPurchase(st, { date: '2026-11-10', amount: KD(400) });
+  const before = E.simulate(st, { today: TODAY, until: '2027-01' });
+  ok(A.addVisaPayment(st, { date: '2026-12-02', amount: KD(400) }, '2026-12-02'));
+  assert.equal(st.visa.payments[0].cashMonth, '2026-12');
+  const after = E.simulate(st, { today: TODAY, until: '2027-01' });
+  const out = after.months.reduce((a, m) => a + m.visaOut, 0);
+  assert.equal(out, KD(400));
+  assert.equal(after.byKey['2026-12'].cashEnd, before.byKey['2026-12'].cashEnd - KD(400));
+  // بدون خصم من الخطة
+  const st2 = fresh();
+  A.addVisaPurchase(st2, { date: '2026-11-10', amount: KD(400) });
+  ok(A.addVisaPayment(st2, { date: '2026-12-02', amount: KD(400), cashMonth: null }, '2026-12-02'));
+  assert.equal(E.simulate(st2, { today: TODAY }).months.reduce((a, m) => a + m.visaOut, 0), 0);
+});
+
+test('الترحيل من النسخة الأولى لا يفقد أي بيانات', () => {
+  // بيانات بصيغة الإصدار 1 كما حُفظت سابقًا
+  const v1 = fresh();
+  v1.schema = 1;
+  delete v1.settings.payoffPriority;
+  A.addPayment(v1, { itemId: 'furniture', month: '2026-09', amount: KD(460), date: '2026-09-25' }, { today: TODAY });
+  A.addPayment(v1, { itemId: 'violations', month: '2026-11', amount: KD(160), date: '2026-11-25' }, { today: TODAY });
+  A.addVisaPurchase(v1, { date: '2026-11-10', amount: KD(400) });
+  A.addExtra(v1, { month: '2026-12', name: 'x', amount: KD(10), status: 'pending' });
+  for (const p of v1.payments) delete p.confirmed;
+  const raw = JSON.parse(JSON.stringify(v1));
+  const { state: v2, changed } = E.migrate(JSON.parse(JSON.stringify(raw)));
+  assert.equal(changed, true);
+  assert.equal(v2.schema, 2);
+  assert.equal(v2.payments.length, 2);
+  assert.ok(v2.payments.every((p) => p.confirmed === true));
+  assert.deepEqual(v2.payments.map((p) => [p.id, p.amount, p.month, p.date]), raw.payments.map((p) => [p.id, p.amount, p.month, p.date]));
+  assert.deepEqual(v2.visa, raw.visa);
+  assert.deepEqual(v2.extras, raw.extras);
+  assert.deepEqual(v2.months, raw.months);
+  assert.deepEqual(v2.items.map((i) => [i.id, i.opening]), raw.items.map((i) => [i.id, i.opening]));
+  assert.equal(v2.settings.payoffPriority[0], 'violations');
+  assert.equal(E.debtStatus(v2, E.itemById(v2, 'furniture')).remaining, KD(5050));
+  // الترحيل مرة ثانية لا يغيّر شيئًا
+  assert.equal(E.migrate(v2).changed, false);
 });

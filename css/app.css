@@ -91,7 +91,8 @@ input, select, textarea { font: inherit; color: inherit; }
 .bar { height: 10px; background: var(--raised-2); border-radius: 6px; overflow: hidden; }
 .bar > i { display: block; height: 100%; background: #fff; border-radius: 6px; transition: width .35s ease; }
 .bar.orange > i { background: var(--orange); }
-.bar-legend { display: flex; justify-content: space-between; margin-top: 10px; font-size: 14.5px; color: var(--text-2); }
+.bar-legend { display: flex; justify-content: space-between; gap: 12px; margin-top: 10px; font-size: 14px; color: var(--text-2); }
+.bar-legend b { margin-inline-start: 3px; }
 .bar-legend b { color: var(--text); font-weight: 600; }
 
 .divider { height: 1px; background: var(--line); margin: 16px 0; }
@@ -234,3 +235,10 @@ input[type="date"].input { direction: ltr; text-align: right; display: block; }
   .grid .streak { display: none; }
   .chk svg { width: 26px; height: 26px; }
 }
+
+.arr-row { flex-wrap: wrap; row-gap: 8px; }
+.arr-row .main { flex: 1 1 100%; }
+.arr-row .amt { margin-inline-end: auto; text-align: start; }
+.arr-row .amt .a { font-size: 20px; }
+.arr-in { width: 120px; flex: none; min-height: 40px; padding: 8px 10px; font-size: 15px; border-radius: 12px; }
+.note b { color: var(--text); font-weight: 600; }
